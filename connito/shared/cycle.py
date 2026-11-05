@@ -1,0 +1,1071 @@
+from __future__ import annotations
+
+import hashlib
+import shutil
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, NamedTuple
+
+
+class ValidatorMinerAssignment(NamedTuple):
+    """Result of `get_validator_miner_assignment`.
+
+    Attributes:
+        assignment: validator_hotkey -> assigned miner hotkeys, post
+            incentive truncation and seeded distribution. This is the
+            "official" assignment used for the penalty pass and for
+            ordering the head of the evaluation roster.
+        miners_with_checkpoint: every miner that has a chain checkpoint
+            this cycle (in the configured expert group), *before* the
+            `foreground_top_n * num_validators` incentive truncation.
+            Background download/eval can use this wider set so it covers
+            miners outside this validator's slice.
+        chain_checkpoints_by_hotkey: hotkey -> the miner's `ChainCheckpoint`
+            (carrying signed_model_hash, model_hash, expert_group, etc.).
+            The eval path uses this to verify each submission via
+            `ChainCheckpoint.validate(expected)` without
+            re-fetching anything from chain at eval time.
+    """
+    assignment: dict[str, list[str]]
+    miners_with_checkpoint: list[str]
+    chain_checkpoints_by_hotkey: dict[str, "ChainCheckpoint"] = {}
+
+import bittensor
+import requests
+from pydantic import BaseModel
+
+from connito.shared import bt_compat  # noqa: E402
+from connito.shared.app_logging import configure_logging, log_phase, structlog
+from connito.shared.chain import (
+    MinerChainCommit,
+    ValidatorChainCommit,
+    WorkerChainCommit,
+    get_chain_commits,
+    serve_axon,
+)
+from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
+from connito.shared.helper import (
+    get_with_retry,
+    MINER_CHECKPOINT_SUFFIXES,
+    h256_int,
+    parse_dynamic_filename,
+)
+from connito.shared.hf_distribute import download_checkpoint_from_hf
+
+configure_logging()
+logger = structlog.get_logger(__name__)
+
+
+BITTENSOR_BLOCK_TIME_SECONDS: int = 12
+# Cap wait_till sleeps so a long phase-distance doesn't leave the process idle
+# for half an hour without re-checking the chain — it should wake up at least
+# every 15 minutes to handle phase resets, clock drift, and chain hiccups.
+WAIT_TILL_MAX_SLEEP_SECONDS: int = 15 * 60
+
+# Test toggle: when set, `wait_till` returns a synthetic PhaseResponse
+# immediately without sleeping or polling the chain. Drives end-to-end
+# integration tests / local replays that don't have a live subtensor.
+_TEST_MODE: bool = False
+
+
+def set_test_mode(enabled: bool) -> None:
+    """Enable/disable wait_till short-circuiting for tests."""
+    global _TEST_MODE
+    _TEST_MODE = bool(enabled)
+    if _TEST_MODE:
+        logger.warning("cycle: TEST MODE enabled — wait_till() will not block")
+
+
+class PhaseResponseLite(BaseModel):
+    phase_name: str
+    phase_start_block: int
+    phase_end_block: int
+class PhaseResponse(BaseModel):
+    block: int
+    cycle_length: int  # how long is one cycle
+    cycle_index: int  # which cycle are we in
+    cycle_block_index: int  # how far in block are we into a cycle
+    phase_name: str  # what is the name of the current phase
+    phase_index: int  # what is the id of the phase
+    phase_start_block: int  # the start block of the phase
+    phase_end_block: int  # the end block of the phase
+    blocks_into_phase: int  # how far in block are we in the current phase
+    blocks_remaining_in_phase: int  # how manuy block left in the phase
+
+
+@dataclass
+class PhaseNames:
+    distribute: str = "Distribute"  # miner download from validator
+    train: str = "Train"  # miner trian
+    miner_commit_1: str = "MinerCommit1"  # miner commit signed_model_hash and vlaidators commit seed
+    miner_commit_2: str = "MinerCommit2"  # miner commit model_hash
+    submission: str = "Submission"  # miner submit model to validator
+    validate: str = "Validate"  # validator validate
+    merge: str = "Merge"  # validator merge
+    validator_commit_1: str = "ValidatorCommit1"  # validator commit signed_model_hash
+    validator_commit_2: str = "ValidatorCommit2"  # validator commit model_hash
+
+
+_PHASE_PERIOD_ATTR: dict[str, str] = {
+    PhaseNames.distribute: "distribute_period",
+    PhaseNames.train: "train_period",
+    PhaseNames.miner_commit_1: "commit_period",
+    PhaseNames.miner_commit_2: "commit_period",
+    PhaseNames.submission: "submission_period",
+    PhaseNames.validate: "validate_period",
+    PhaseNames.merge: "merge_period",
+    PhaseNames.validator_commit_1: "commit_period",
+    PhaseNames.validator_commit_2: "commit_period",
+}
+
+
+class PhaseManager:
+    """Block-height phase clock, computed locally from `config.cycle.*`.
+
+    The subnet owner's cycle-api serves the authoritative phase over HTTP
+    (`get_phase_from_api`); this is the same arithmetic run in-process, and the
+    validator and miner both construct one. cycle-api is deployed from a
+    separate repository and keeps its own copy, so any change to the phase
+    schedule has to land in both.
+    """
+
+    def __init__(self, config: WorkerConfig, subtensor: bittensor.Subtensor):
+        self.config = config
+        self.subtensor = subtensor
+        self.phases = self.init_phases(config, PhaseNames())
+        self.cycle_length = sum(p["length"] for p in self.phases)
+
+    def init_phases(self, config, names):
+        # ordered phase
+        phases = [
+            {"name": names.distribute, "length": config.cycle.distribute_period},  # miner download model from validator
+            {"name": names.train, "length": config.cycle.train_period},  # miner train
+            {
+                "name": names.miner_commit_1,
+                "length": config.cycle.commit_period,
+            },  # miner commit model hash and validator commit seed
+            {
+                "name": names.miner_commit_2,
+                "length": config.cycle.commit_period,
+            },  # miner commit model hash and validator commit seed
+            {"name": names.submission, "length": config.cycle.submission_period},  # miner submit model to validator
+            {"name": names.validate, "length": config.cycle.validate_period},  # validator validate models from miners
+            {"name": names.merge, "length": config.cycle.merge_period},  # validator merge models
+            {
+                "name": names.validator_commit_1,
+                "length": config.cycle.commit_period,
+            },  # validator commit signed_model_hash
+            {"name": names.validator_commit_2, "length": config.cycle.commit_period},  # validator commit model_hash
+        ]
+        return phases
+
+    def get_phase(self, block: int = None) -> PhaseResponse:
+        if block is None:
+            block = self.subtensor.block
+
+        if block < 0:
+            raise RuntimeError(f"Invalida block input block = {block}")
+
+        cycle_index = block // self.cycle_length
+        cycle_block_index = block % self.cycle_length  # 0..self.cycle_length-1
+
+        # Walk through phases to find which one cycle_block_index is in
+        current_start = 0
+        for idx, phase in enumerate(self.phases):
+            phase_end = current_start + phase["length"]  # exclusive
+            if current_start <= cycle_block_index < phase_end:
+                blocks_into_phase = cycle_block_index - current_start
+                blocks_remaining = phase_end - cycle_block_index - 1
+
+                return PhaseResponse(
+                    block=block,
+                    cycle_length=self.cycle_length,
+                    cycle_index=cycle_index,
+                    cycle_block_index=cycle_block_index,
+                    phase_name=phase["name"],
+                    phase_index=idx,
+                    phase_start_block=current_start + cycle_index * self.cycle_length,
+                    phase_end_block=phase_end - 1 + cycle_index * self.cycle_length,
+                    blocks_into_phase=blocks_into_phase,
+                    blocks_remaining_in_phase=blocks_remaining,
+                )
+            current_start = phase_end
+
+        # Should never happen if PHASES and self.cycle_length are consistent
+        raise RuntimeError("Failed to determine phase")
+
+    def blocks_until_next_phase(self) -> dict[str, tuple[int, int, int]]:
+        """
+        Returns a mapping:
+            { phase_name: (start_block, end_block, blocks_until) }
+
+        Each tuple corresponds to the next occurrence of that phase (in this
+        cycle if upcoming, otherwise the next cycle).
+        """
+        block = self.subtensor.block
+        cycle_len = self.cycle_length
+        cycle_block_index = block % cycle_len  # 0..cycle_len-1
+        cycle_start_block = block - cycle_block_index
+
+        result: dict[str, tuple[int, int, int]] = {}
+
+        start = 0
+        for phase in self.phases:
+            phase_start = start  # phase start within the cycle [0..cycle_len)
+
+            if phase_start >= cycle_block_index:
+                # Phase still ahead in *this* cycle
+                start_block = cycle_start_block + phase_start
+            else:
+                # Phase has already passed in this cycle -> wait for next cycle
+                start_block = cycle_start_block + cycle_len + phase_start
+
+            end_block = start_block + phase["length"] - 1
+            blocks_until = start_block - block
+
+            result[phase["name"]] = (start_block, end_block, blocks_until)
+            start += phase["length"]
+
+        return result
+
+    def previous_phase_block_ranges(self) -> dict[str, tuple[int, int]]:
+        """
+        Returns a mapping:
+            { phase_name: (start_block, end_block) }
+
+        The range corresponds to the most recent completed
+        occurrence of that phase.
+        """
+        next_phase_ranges = self.blocks_until_next_phase()
+        previous_ranges: dict[str, tuple[int, int]] = {}
+        for phase_name, (start_block, end_block, _blocks_until) in next_phase_ranges.items():
+            previous_ranges[phase_name] = (
+                start_block - self.cycle_length,
+                end_block - self.cycle_length,
+            )
+        return previous_ranges
+
+
+def _synth_phase_response_for_test(
+    config: MinerConfig | ValidatorConfig,
+    phase_name: str,
+    last_phase_response: PhaseResponse | None,
+) -> PhaseResponse:
+    """Build a fake PhaseResponse anchored at the current chain block,
+    with phase_end_block derived from the per-phase period in config.cycle.
+    """
+    current_block = last_phase_response.block if last_phase_response is not None else 0
+    period_attr = _PHASE_PERIOD_ATTR.get(phase_name, "commit_period")
+    period = int(getattr(config.cycle, period_attr, 0))
+    # In test mode, give Submission a fixed window so evaluation has room
+    # to land miners regardless of the prod cycle config.
+    if phase_name == PhaseNames.submission:
+        period = 60
+    return PhaseResponse(
+        block=current_block,
+        cycle_length=int(getattr(config.cycle, "cycle_length", 0)),
+        cycle_index=last_phase_response.cycle_index if last_phase_response is not None else 0,
+        cycle_block_index=0,
+        phase_name=phase_name,
+        phase_index=last_phase_response.phase_index if last_phase_response is not None else 0,
+        phase_start_block=current_block,
+        phase_end_block=current_block + period,
+        blocks_into_phase=0,
+        blocks_remaining_in_phase=period,
+    )
+
+
+def wait_till(
+    config: MinerConfig | ValidatorConfig,
+    phase_name: str,
+    poll_fallback_block: int = 3,
+    block_offset: int = 0,
+) -> PhaseResponse:
+    """Block until the chain reaches `phase_start_block + block_offset`.
+
+    - `block_offset == 0` (default): return when `phase_name` begins.
+    - `block_offset > 0`: return `block_offset` blocks INTO `phase_name`.
+    - `block_offset < 0`: return `|block_offset|` blocks BEFORE
+      `phase_name` begins; the caller is still inside the previous phase
+      at return time.
+
+    The returned `PhaseResponse` reflects chain state at return time, so
+    for negative offsets it describes the previous phase. In test mode
+    `block_offset` is ignored; the synthesized response is returned as-is.
+    """
+    if _TEST_MODE:
+        # Still hit should_act so the owner-API path is exercised, but
+        # ignore the result for the wait-condition and synthesize a
+        # PhaseResponse anchored at the current chain block with the
+        # requested phase_name + a config-derived end block.
+        _, _, last_phase_response = should_act(
+            config, phase_name, retry_blocks=poll_fallback_block,
+        )
+        synthetic = _synth_phase_response_for_test(config, phase_name, last_phase_response)
+        period_attr = _PHASE_PERIOD_ATTR.get(phase_name, "commit_period")
+        upstream_phase = last_phase_response.phase_name if last_phase_response is not None else None
+        upstream_block = last_phase_response.block if last_phase_response is not None else None
+        log_phase(
+            f"<{phase_name}> [TEST MODE] returning synthetic phase_response",
+            phase_name=synthetic.phase_name,
+            block=synthetic.block,
+            phase_start_block=synthetic.phase_start_block,
+            phase_end_block=synthetic.phase_end_block,
+            blocks_into_phase=synthetic.blocks_into_phase,
+            blocks_remaining_in_phase=synthetic.blocks_remaining_in_phase,
+            cycle_length=synthetic.cycle_length,
+            cycle_index=synthetic.cycle_index,
+            cycle_block_index=synthetic.cycle_block_index,
+            phase_index=synthetic.phase_index,
+            period_attr=period_attr,
+            upstream_phase_from_api=upstream_phase,
+            upstream_block_from_api=upstream_block,
+        )
+        return synthetic
+
+    phase_response: PhaseResponse | None = None
+    first_print = True
+    # Wall-clock anchor for the wait-heartbeat: every ~15 min of real time
+    # we emit a proof-of-life line via log_phase regardless of how the outer
+    # poll loop happens to slice its sleeps. Anchoring to monotonic() rather
+    # than per-iteration `slept` means short sleep_sec values (when the target
+    # is close) don't suppress the heartbeat.
+    heartbeat_interval = 900.0
+    last_heartbeat_at = time.monotonic()
+    while True:
+        ready, blocks_till, phase_response = should_act(config, phase_name, retry_blocks=poll_fallback_block)
+        if ready is False and blocks_till > 0:
+            sleep_sec = min(blocks_till, max(poll_fallback_block, blocks_till * 0.9)) * BITTENSOR_BLOCK_TIME_SECONDS
+            sleep_sec = min(sleep_sec, WAIT_TILL_MAX_SLEEP_SECONDS)
+
+        # Blocks remaining until target = phase_start_block + block_offset.
+        # Once `ready` flips True we're inside the named phase; before that
+        # `blocks_till` counts down to its start.
+        if ready and phase_response is not None:
+            blocks_remaining = block_offset - phase_response.blocks_into_phase
+        else:
+            blocks_remaining = blocks_till + block_offset
+
+        if blocks_remaining <= 0:
+            break
+
+        sleep_sec = min(
+            blocks_remaining,
+            max(poll_fallback_block, blocks_remaining * 0.9),
+        ) * BITTENSOR_BLOCK_TIME_SECONDS
+        # Same cap as the early-return branch above: don't sleep past the
+        # max so we re-poll the chain at least every WAIT_TILL_MAX_SLEEP_SECONDS
+        # seconds. Without this, a wait with blocks_remaining > ~75 would sleep
+        # past the cap (e.g. blocks_remaining=316 → ~57 min single sleep).
+        sleep_sec = min(sleep_sec, WAIT_TILL_MAX_SLEEP_SECONDS)
+
+        if first_print:
+            offset_label = ""
+            if block_offset > 0:
+                offset_label = f" + {block_offset} blocks"
+            elif block_offset < 0:
+                offset_label = f" - {-block_offset} blocks"
+            expect_time = datetime.now() + timedelta(seconds=blocks_remaining * BITTENSOR_BLOCK_TIME_SECONDS)
+            log_phase(
+                f"<{phase_name}>{offset_label} target in {blocks_remaining} blocks, "
+                f"at {expect_time.strftime('%H:%M:%S')}"
+            )
+        first_print = False
+        # Sleep in <=60 s slices so a heartbeat / external kill can be
+        # observed within ~60 s. Heartbeat emission is anchored to wall-clock
+        # (last_heartbeat_at, declared above the outer loop) so it fires on
+        # a 15-min cadence regardless of how the outer loop slices sleeps.
+        # Use log_phase (stdout, always visible) rather than logger.debug —
+        # operators watching the validator should see proof-of-life even
+        # when debug logs are filtered out.
+        slept = 0.0
+        slice_sec = 60.0
+        while slept < sleep_sec:
+            this_slice = min(slice_sec, sleep_sec - slept)
+            time.sleep(this_slice)
+            slept += this_slice
+            now = time.monotonic()
+            if now - last_heartbeat_at >= heartbeat_interval:
+                eta_str = ""
+                if phase_response is not None:
+                    eta = datetime.now() + timedelta(
+                        seconds=blocks_remaining * BITTENSOR_BLOCK_TIME_SECONDS
+                    )
+                    eta_str = f", target ~{eta.strftime('%H:%M:%S')}"
+                log_phase(
+                    f"<{phase_name}> wait heartbeat: {blocks_remaining} blocks remaining"
+                    f"{eta_str}",
+                    phase_name=phase_name,
+                    block_offset=block_offset,
+                )
+                last_heartbeat_at = now
+
+    if phase_response is None:
+        logger.warning(
+            f"wait_till: loop exited but phase_response is None for phase "
+            f"'{phase_name}' (block_offset={block_offset})"
+        )
+    log_phase(
+        f"<{phase_name}> reached (block_offset={block_offset}); "
+        f"current phase=<{phase_response.phase_name}>, "
+        f"{phase_response.blocks_into_phase} blocks into it, "
+        f"{phase_response.blocks_remaining_in_phase} blocks left."
+    )
+    return phase_response
+
+
+def check_phase_expired(subtensor: bittensor.Subtensor, phase_response: PhaseResponse) -> bool:
+    current_block = subtensor.block
+    blocks_remaining = phase_response.phase_end_block - current_block
+    if current_block > phase_response.phase_end_block:
+        logger.warning(
+            f"<{phase_response.phase_name}> phase did not complete on time",
+            current_block=current_block,
+            phase_end_block=phase_response.phase_end_block,
+            diff=blocks_remaining,
+        )
+        return True
+    
+    if blocks_remaining >= 0:
+        log_phase(
+            f"<{phase_response.phase_name}> phase completed on time",
+            blocks_remaining=blocks_remaining,
+        )
+    
+    return False
+
+
+def should_act(config: MinerConfig | ValidatorConfig, phase_name: str, retry_blocks: int) -> tuple[bool, int, PhaseResponse | None]:
+    phase_response: PhaseResponse | None = get_phase_from_api(config)
+
+    if phase_response is None:
+        ready = False
+    else:
+        ready = phase_response.phase_name == phase_name
+
+    blocks_till_next_phase = get_blocks_until_next_phase_from_api(config)
+
+    if blocks_till_next_phase is None:
+        blocks_till = retry_blocks
+    else:
+        blocks_till = blocks_till_next_phase[phase_name][2]
+
+    return ready, blocks_till, phase_response
+
+
+def search_model_submission_destination(
+    wallet: bittensor.Wallet, config: MinerConfig, subtensor: bittensor.Subtensor
+) -> bt_compat.AxonInfo | None:
+    
+    validator_miner_assignment = get_validator_miner_assignment(config, subtensor).assignment
+
+    assigned_validator_hotkey = None
+    for validator, miners in validator_miner_assignment.items():
+        if wallet.hotkey.ss58_address in miners:
+            assigned_validator_hotkey = validator
+            break
+
+    if assigned_validator_hotkey is None:
+        return None
+
+    metagraph = bt_compat.get_metagraph(subtensor, config.chain.netuid)
+    uid = metagraph.hotkeys.index(assigned_validator_hotkey)
+
+    logger.debug("Resolved validator axon", hotkey=f"{assigned_validator_hotkey[:4]}...{assigned_validator_hotkey[-4:]}", uid=uid)
+
+    return metagraph.axons[uid]
+
+
+def assign_miners_to_validators(
+    validators: dict[str, Any],  # {validator_id: seed}
+    miners: list[str],
+    max_miners_per_validator: int | None = None,
+) -> dict[str, list[str]]:
+    n_v = len(validators)
+    n_m = len(miners)
+
+    if n_v == 0:
+        logger.warning("No validators provided, returning empty assignments")
+        return {}
+
+    # --- 0) Combined seed (hash of all validator seeds)
+    combined_seed_str = "".join(str(validators[v]) for v in sorted(validators.keys()))
+    combined_seed = hashlib.sha256(combined_seed_str.encode()).hexdigest()
+
+    # --- 1) Balanced capacities
+    base = n_m // n_v
+    rem = n_m % n_v
+    v_ids = list(validators.keys())
+
+    ranked_for_bonus = sorted(
+        v_ids,
+        key=lambda vid: h256_int("cap_bonus", validators[vid], combined_seed),
+        reverse=True,
+    )
+    capacities = {vid: base for vid in v_ids}
+    for vid in ranked_for_bonus[:rem]:
+        capacities[vid] += 1
+
+    # Cap each validator's capacity
+    if max_miners_per_validator is not None:
+        for vid in v_ids:
+            capacities[vid] = min(capacities[vid], max_miners_per_validator)
+
+    # --- 2) Deterministic miner order seeded by combined validator seed
+    miners_sorted = sorted(miners, key=lambda mid: h256_int("miner_order", mid, combined_seed))
+
+    # --- 3) Preference per miner (based on validator seed + combined seed)
+    def validator_prefs(mid: str) -> list[str]:
+        return sorted(
+            v_ids,
+            key=lambda vid: h256_int("preference", mid, validators[vid], combined_seed),
+            reverse=True,
+        )
+
+    # --- 4) Assign miners evenly, respecting capacities
+    assignment: dict[str, list[str]] = {vid: [] for vid in v_ids}
+    for mid in miners_sorted:
+        prefs = validator_prefs(mid)
+        for vid in prefs:
+            if capacities[vid] > 0:
+                assignment[vid].append(mid)
+                capacities[vid] -= 1
+                break
+        else:
+            # Should never happen if capacities sum == len(miners)
+            assignment[prefs[-1]].append(mid)
+
+    return assignment
+
+
+def _get_minercommit2_block_hash(
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+) -> str | None:
+    """Return the chain block hash of the LAST block of the most recent
+    completed `MinerCommit2` phase.
+
+    That block is sealed BEFORE miners' commit window closes and before
+    validators run `Round.freeze`, but its hash is not predictable in
+    advance — no party controls block production. Mixing this hash into
+    the combined eval seed (see `get_combined_validator_seed`) makes the
+    eval data slice unpredictable to miners *and* unforgeable by any
+    validator(s) acting alone, closing the validator-miner collusion
+    attack that the publicly-committed `miner_seed` scheme allowed.
+
+    Returns the 0x-prefixed hex hash string, or None if the phase API
+    or chain RPC is unavailable. After the block-hash-only seed
+    cutover, `get_combined_validator_seed` treats None as a hard
+    failure and raises rather than silently producing a publicly-
+    known sha256("") — letting the validator framework retry / skip
+    the round upstream instead of running a round on a guessable
+    seed.
+    """
+    previous_phase_range = get_blocks_from_previous_phase_from_api(config)
+    if previous_phase_range is None:
+        logger.warning("Phase API unavailable; cannot derive block-hash component of seed")
+        return None
+
+    phase_range = previous_phase_range.get(PhaseNames.miner_commit_2)
+    if not phase_range or len(phase_range) < 2:
+        logger.warning(
+            "Phase API did not return MinerCommit2 range; cannot derive block-hash seed",
+            previous_phase_range=previous_phase_range,
+        )
+        return None
+
+    last_block = int(phase_range[1])
+    try:
+        block_hash = bt_compat.get_block_hash(subtensor, last_block)
+    except Exception as exc:  # noqa: BLE001 — chain RPC can throw a variety
+        logger.warning(
+            "get_block_hash failed for MinerCommit2 last block",
+            block=last_block, error=str(exc),
+        )
+        return None
+
+    if not block_hash:
+        logger.warning(
+            "get_block_hash returned empty for MinerCommit2 last block",
+            block=last_block,
+        )
+        return None
+
+    return str(block_hash)
+
+
+def get_combined_validator_seed(
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+    *,
+    commits: list[tuple[WorkerChainCommit, bt_compat.NeuronInfo]] | None = None,
+) -> str:
+    """
+    Deterministically derive the combined validator seed from chain entropy.
+
+    The seed is `sha256(block_hash).hexdigest()`, where `block_hash` is
+    the hash of the LAST block of the most recent completed
+    `MinerCommit2` phase (`_get_minercommit2_block_hash`).
+
+    Why block-hash-only (not mixed with validator-committed seeds):
+      * The validator-committed `miner_seed` values are publicly
+        readable on chain during the miners' commit window, so a
+        miner-validator collusion could let miners learn the
+        combined seed and pre-fit on the predictable eval slice.
+      * The block hash is sealed before miners' commit window closes
+        but its value is unpredictable in advance — no party controls
+        block production. So block_hash alone provides
+        collusion-resistant entropy with strictly less attack surface
+        than mixing in a chain-readable component.
+
+    The previous scheme mixed both inputs as a backward-compatible
+    transition; that transition is complete. The `miner_seed` field
+    remains on the `ValidatorChainCommit` for `get_validator_miner_assignment`
+    (which uses it to derive a deterministic validator → miner
+    assignment from sorted per-validator integers) but it no longer
+    contributes to the eval seed.
+
+    Failure model:
+      * If `_get_minercommit2_block_hash` returns None (phase API or
+        chain RPC failure), this function raises `RuntimeError`. The
+        previous behavior — falling back to `sha256("")`, a publicly
+        known constant — let miners win the round trivially during
+        transient outages. Raising lets the validator framework
+        retry / skip the round upstream instead.
+
+    `commits` is accepted for API compatibility with prior callers
+    that pre-fetched chain commits to avoid a duplicate archive RPC,
+    but is no longer read here. The argument is kept (and accepted)
+    so call sites in `Round.freeze` and tests need not change.
+    """
+    # `commits` is no longer needed for the seed itself (the legacy
+    # validator_seeds mix is gone) — but the parameter is preserved so
+    # callers that share a head-block commits fetch with sibling
+    # helpers like `get_validator_miner_assignment` don't have to
+    # change their signature.
+    _ = commits
+
+    block_hash = _get_minercommit2_block_hash(config, subtensor)
+    if not block_hash:
+        # Hard guard. The previous fallback (`sha256("")`) was the
+        # known deficiency flagged in the original mixed-seed PR; it
+        # let miners win the round trivially whenever the phase API
+        # or chain RPC blipped. Raise so the validator framework
+        # retries / skips the round instead of running on a guessable
+        # seed.
+        raise RuntimeError(
+            "Cannot derive combined validator seed: MinerCommit2 "
+            "block hash unavailable (phase API or chain RPC failure). "
+            "Skipping seed derivation rather than producing a "
+            "publicly-known sha256('') — caller should retry or skip "
+            "the round."
+        )
+
+    logger.info("Combined validator seed input", block_hash=block_hash)
+
+    return hashlib.sha256(block_hash.encode()).hexdigest()
+
+
+def get_validator_miner_assignment(
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+    *,
+    commits: list[tuple[WorkerChainCommit, bt_compat.NeuronInfo]] | None = None,
+    metagraph: bt_compat.MetagraphView | None = None,
+) -> ValidatorMinerAssignment:
+    """Resolve the validator → miner assignment for the current phase.
+
+    `commits` and `metagraph` are head-block reads that callers often already
+    have in hand (e.g. `Round.freeze` is invoked with a metagraph and
+    immediately needs commits twice — once for the seed and once here).
+    Passing them in skips the duplicate RPCs against the archive endpoint
+    that share the global `_subtensor_lock`.
+    """
+    from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
+
+    if commits is None:
+        commits = get_chain_commits(config, subtensor)
+    validator_seeds = get_validator_seed_from_commit(config, commits)
+    miners = get_miners_from_commit(config, commits)
+
+    # Filter miners to only those with a chain checkpoint from the previous commit phase
+    chain_checkpoints = build_chain_checkpoints_from_previous_phase(
+        config=config, subtensor=subtensor, for_role="miner",
+    )
+    # Index by hotkey so the eval path can look up signed_model_hash /
+    # model_hash / expert_group for `_verify_*` without re-touching the chain.
+    chain_checkpoints_by_hotkey = {
+        ckpt.hotkey: ckpt for ckpt in chain_checkpoints.checkpoints if ckpt.hotkey
+    }
+    miners_with_checkpoint = set(chain_checkpoints_by_hotkey.keys())
+    excluded_miners = [m for m in miners if m not in miners_with_checkpoint]
+    if excluded_miners and len(excluded_miners) == len(miners):
+        logger.info(
+            "get_validator_miner_assignment: all miners excluded — none have chain checkpoint",
+            excluded_count=len(excluded_miners),
+            excluded_miners=[f"{hk[:4]}...{hk[-4:]}" for hk in excluded_miners],
+        )
+    elif excluded_miners:
+        logger.debug(
+            "get_validator_miner_assignment: excluding miners without chain checkpoint",
+            excluded_count=len(excluded_miners),
+            excluded_miners=[f"{hk[:4]}...{hk[-4:]}" for hk in excluded_miners],
+        )
+    miners = [m for m in miners if m in miners_with_checkpoint]
+
+    # Rank miners by incentive desc and keep only the top
+    # foreground_top_n * num_validators. The remainder is dropped
+    # before assignment so validators do not waste cycles on low-incentive
+    # miners that would never be reached anyway.
+    if metagraph is None:
+        metagraph = bt_compat.get_metagraph(subtensor, config.chain.netuid)
+    hotkey_to_uid = {hk: uid for uid, hk in enumerate(metagraph.hotkeys)}
+
+    def _incentive(hk: str) -> float:
+        uid = hotkey_to_uid.get(hk)
+        if uid is None:
+            return 0.0
+        try:
+            return float(metagraph.incentive[uid].item())
+        except Exception:
+            return 0.0
+
+    # Tie-break on hotkey for determinism across validators.
+    miners.sort(key=lambda hk: (-_incentive(hk), hk))
+
+    # Snapshot the full incentive-ordered checkpoint set before truncation —
+    # callers that want subnet-wide coverage (e.g. bg-download/eval) need
+    # this; the assignment slice still uses the truncated list.
+    all_miners_with_checkpoint = list(miners)
+
+    cap = config.evaluation.foreground_top_n * max(len(validator_seeds), 1)
+    truncated = miners[cap:]
+    miners = miners[:cap]
+    if truncated:
+        logger.debug(
+            "get_validator_miner_assignment: dropped low-incentive miners beyond capacity",
+            kept=len(miners),
+            dropped=len(truncated),
+            cap=cap,
+        )
+
+    logger.debug(
+        "get_validator_miner_assignment: inputs",
+        expert_group_id=config.task.exp.group_id,
+        validator_count=len(validator_seeds),
+        miner_count=len(miners),
+        validator_seeds={f"{hk[:4]}...{hk[-4:]}": seed for hk, seed in validator_seeds.items()},
+        miners=[f"{hk[:4]}...{hk[-4:]}" for hk in miners],
+    )
+
+    validator_miner_assignment = assign_miners_to_validators(
+        validator_seeds, miners, max_miners_per_validator=config.evaluation.foreground_top_n,
+    )
+
+    logger.info(
+        "Validator-miner assignment",
+        validators=len(validator_miner_assignment),
+        assignment={
+            f"{v[:4]}...{v[-4:]}": [f"{m[:4]}...{m[-4:]}" for m in ms]
+            for v, ms in validator_miner_assignment.items()
+        },
+    )
+    return ValidatorMinerAssignment(
+        assignment=validator_miner_assignment,
+        miners_with_checkpoint=all_miners_with_checkpoint,
+        chain_checkpoints_by_hotkey=chain_checkpoints_by_hotkey,
+    )
+
+
+def get_validator_seed_from_commit(config, commits):
+    def _derive_validator_assignment_seed(commit: ValidatorChainCommit, hotkey: str) -> int:
+        # Keep `miner_seed` in the schema contract, but treat omitted values as
+        # the default assignment seed to preserve the compact chain payload.
+        legacy_seed = getattr(commit, "miner_seed", None)
+        if legacy_seed is not None:
+            return int(legacy_seed)
+        return 0
+
+    validator_seeds: dict[str, int] = {
+        neuron.hotkey: _derive_validator_assignment_seed(commit, neuron.hotkey)
+        for commit, neuron in commits
+        if isinstance(commit, ValidatorChainCommit)
+        and getattr(commit, "expert_group", None) == config.task.exp.group_id
+    }
+    return validator_seeds
+
+
+def get_miners_from_commit(config, commits):
+    miners: list[str] = [
+        neuron.hotkey
+        for commit, neuron in commits
+        if isinstance(commit, MinerChainCommit) and getattr(commit, "expert_group", None) == config.task.exp.group_id
+    ]
+
+    return miners
+
+
+def get_phase_from_api(config: WorkerConfig) -> PhaseResponse | None:
+    """
+    Determine current phase based on block schedule.
+
+    Returns:
+        str: one of ["training", "submission", "waiting"]
+    """
+    base_url = config.cycle.owner_url
+    url = f"{base_url}/get_phase"
+
+    resp = get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
+    if resp is None:
+        return None
+
+    try:
+        return PhaseResponse(**resp.json())
+    except (ValueError, TypeError) as e:
+        # ValueError: JSON decode problems
+        # TypeError: PhaseResponse(**...) got unexpected/missing fields
+        logger.exception("Bad response payload from %s: %s", url, e)
+        return None
+
+
+def get_blocks_until_next_phase_from_api(config: WorkerConfig) -> dict[str, tuple[int, int, int]] | None:
+    """
+    Determine current phase based on block schedule.
+
+    Returns:
+        str: one of ["training", "submission", "waiting"]
+    """
+    base_url = config.cycle.owner_url
+    url = f"{base_url}/blocks_until_next_phase"
+
+    resp = get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
+    if resp is None:
+        return None
+
+    try:
+        return resp.json()
+    except ValueError as e:
+        # JSON decoding failed
+        logger.exception("Invalid JSON from %s: %s", url, e)
+        return None
+
+
+def get_blocks_from_previous_phase_from_api(config: WorkerConfig) -> dict | None:
+    """
+    Determine current phase based on block schedule.
+
+    Returns:
+        str: one of ["training", "submission", "waiting"]
+    """
+    base_url = config.cycle.owner_url
+    url = f"{base_url}/previous_phase_blocks"
+
+    resp = get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
+    if resp is None:
+        return None
+
+    try:
+        return resp.json()
+    except ValueError as e:
+        # JSON decoding failed
+        logger.exception("Invalid JSON from %s: %s", url, e)
+        return None
+
+def get_validator_whitelist_from_api(config, *, strict: bool = False) -> set[str]:
+    """Fetch the validator whitelist from the owner phase service.
+
+    With strict, a failure after the retries (a 429 included) raises rather than returning an empty whitelist."""
+    base_url = config.cycle.owner_url
+    url = f"{base_url}/get_validator_whitelist"
+
+    resp = get_with_retry(
+        url,
+        timeout=config.cycle.api_timeout_sec,
+        retries=config.cycle.api_retries,
+        backoff=config.cycle.api_backoff_sec,
+    )
+    if resp is None:
+        if strict:
+            raise RuntimeError(f"validator whitelist unavailable from {url} after {config.cycle.api_retries} retries")
+        logger.warning("Failed to fetch validator whitelist from owner API")
+        return set()
+
+    try:
+        hotkeys = resp.json()
+        if strict and not (isinstance(hotkeys, list) and all(isinstance(h, str) for h in hotkeys)):
+            raise ValueError(f"expected a list of hotkeys, got {type(hotkeys).__name__}")
+        logger.debug("fetched validator whitelist", count=len(hotkeys))
+        return set(hotkeys)
+    except (ValueError, TypeError) as e:
+        if strict:
+            raise RuntimeError(f"invalid validator whitelist from {url}: {e}") from None
+        logger.exception("Invalid JSON from %s: %s", url, e)
+        return set()
+def get_allowed_version_range(config: WorkerConfig) -> tuple[int | None, int | None]:
+    """
+    Return (min_allowed_version, max_allowed_version) for global_ver filtering.
+
+    max_allowed_version: start block of the most recent MinerCommit1 phase.
+    min_allowed_version: max_allowed_version - 1.5 * cycle_length.
+
+    Both are derived from the owner phase service API.
+    Returns (None, None) if the API is unavailable.
+    """
+    current_phase = get_phase_from_api(config)
+    if current_phase is not None and current_phase.phase_name == PhaseNames.miner_commit_1:
+        max_version = current_phase.phase_start_block
+        cycle_length = current_phase.cycle_length
+        min_version = max_version - int(cycle_length * config.cycle.version_range_cycles)
+        logger.debug(
+            "get_allowed_version_range: currently in MinerCommit1",
+            min_version=min_version, max_version=max_version, cycle_length=cycle_length,
+        )
+        return min_version, max_version
+
+    previous_ranges = get_blocks_from_previous_phase_from_api(config)
+    if previous_ranges is None:
+        logger.warning("get_allowed_version_range: could not fetch previous phase ranges")
+        return None, None
+
+    miner_commit_1_range = previous_ranges.get(PhaseNames.miner_commit_1)
+    if miner_commit_1_range is None:
+        logger.warning("get_allowed_version_range: MinerCommit1 not found in previous phase ranges")
+        return None, None
+
+    max_version = miner_commit_1_range[0]  # start block
+
+    # derive cycle_length as sum of all phase lengths
+    cycle_length = sum((end - start + 1) for start, end in previous_ranges.values())
+
+    min_version = max_version - int(cycle_length * config.cycle.version_range_cycles)
+    logger.debug(
+        "get_allowed_version_range",
+        min_version=min_version, max_version=max_version, cycle_length=cycle_length,
+    )
+    return min_version, max_version
+
+
+def load_submission_files(folder: str = "miner_submission"):
+    """
+    Scans a folder for miner-checkpoint files (.safetensors or .pt) and
+    returns:
+        { filename: {parsed key/values} }
+    """
+    folder_path = Path(folder)
+    if not folder_path.exists():
+        raise FileNotFoundError(f"Folder not found: {folder_path.resolve()}")
+
+    files_dict = {}
+    candidates = [
+        p for suffix in MINER_CHECKPOINT_SUFFIXES
+        for p in folder_path.glob(f"*{suffix}")
+    ]
+    for file_name in candidates:
+        if file_name.name.startswith("._tmp"):
+            continue
+        meta = parse_dynamic_filename(file_name.name)
+        if meta is None:
+            continue
+        files_dict[file_name.name] = meta
+
+    return files_dict
+
+
+def hydrate_miner_submissions_from_hf(
+    config: ValidatorConfig,
+    subtensor: bittensor.Subtensor,
+    validator_miner_assignment: dict[str, list[str]],
+) -> int:
+    """Pull HF-committed miner checkpoints into the local submission dir.
+
+    Miners that upload to HuggingFace during MinerCommit2 advertise
+    ``(hf_repo_id, hf_revision)`` in their chain commit. By Submission phase
+    those coords are on chain, so the validator pulls the shard directly
+    from HuggingFace. The downloaded file is written with the
+    ``hotkey_*_block_*.pt`` naming convention so ``gather_validation_job``
+    can pick it up. Miners without HF coords, or whose HF download fails,
+    are missing for this round and receive the zero-score penalty via the
+    existing missing-submission pass.
+
+    Returns the number of miners hydrated this call.
+    """
+    # Local imports: checkpoints.py imports this module, so a module-level
+    # import of build_chain_checkpoints_from_previous_phase is circular.
+    from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
+
+    miner_assignment = set(validator_miner_assignment.get(config.chain.hotkey_ss58, []))
+    if not miner_assignment:
+        return 0
+
+    submission_dir = Path(config.ckpt.miner_submission_path)
+    submission_dir.mkdir(parents=True, exist_ok=True)
+
+    # A miner with any existing submission file is skipped — the background
+    # download worker may have already placed the file, and we don't want to
+    # re-download on subsequent polls.
+    existing_hotkeys: set[str] = set()
+    for file_path in submission_dir.glob("*.pt"):
+        if file_path.name.startswith(".tmp"):
+            continue
+        meta = parse_dynamic_filename(file_path.name)
+        if meta and "hotkey" in meta:
+            existing_hotkeys.add(meta["hotkey"])
+
+    try:
+        chain_checkpoints = build_chain_checkpoints_from_previous_phase(
+            config=config, subtensor=subtensor, for_role="miner",
+        )
+    except Exception as e:
+        logger.warning("hydrate_miner_submissions_from_hf: failed to build chain checkpoints", error=str(e))
+        return 0
+
+    expert_group_id = config.task.exp.group_id
+    filename_in_hf = f"model_expgroup_{expert_group_id}.pt"
+
+    hydrated = 0
+    for ckpt in chain_checkpoints.checkpoints:
+        if ckpt.hotkey is None or ckpt.hotkey not in miner_assignment:
+            continue
+        if ckpt.hotkey in existing_hotkeys:
+            continue
+        if not (ckpt.hf_repo_id and ckpt.hf_revision):
+            continue
+
+        tmp_dir = submission_dir / f".tmp_hf_{ckpt.hotkey}"
+        dest_name = f"hotkey_{ckpt.hotkey}_block_{subtensor.block}.pt"
+        dest = submission_dir / dest_name
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            download_checkpoint_from_hf(
+                repo_id=ckpt.hf_repo_id,
+                revision=ckpt.hf_revision,
+                filenames=[filename_in_hf],
+                dest_dir=tmp_dir,
+                token_env_var=config.hf.token_env_var,
+            )
+            # Atomic rename so gather_validation_job never sees a partial file.
+            (tmp_dir / filename_in_hf).replace(dest)
+            existing_hotkeys.add(ckpt.hotkey)
+            hydrated += 1
+            logger.info(
+                "Hydrated miner submission from HF",
+                hotkey=ckpt.hotkey[:6],
+                uid=ckpt.uid,
+                hf_repo_id=ckpt.hf_repo_id,
+                hf_revision=ckpt.hf_revision,
+                dest=str(dest),
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to hydrate miner submission from HF",
+                hotkey=ckpt.hotkey[:6] if ckpt.hotkey else None,
+                hf_repo_id=ckpt.hf_repo_id,
+                hf_revision=ckpt.hf_revision,
+                error=str(e),
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return hydrated

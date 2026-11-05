@@ -1,0 +1,1353 @@
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import string
+import sys
+from pathlib import Path
+from typing import Any, ClassVar, Iterable, Literal
+
+import bittensor
+import fsspec
+import torch
+import yaml
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    ValidationError,
+    model_validator,
+)
+from pydantic.fields import FieldInfo
+from pydantic_core import PydanticUndefined
+
+from connito.shared.app_logging import configure_logging, structlog
+from connito.shared.bt_compat import KeyfileError, get_metagraph
+from connito.shared.helper import convert_to_str
+
+configure_logging()
+logger = structlog.get_logger(__name__)
+
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def is_running_in_docker() -> bool:
+    """Return True if we are inside a Docker container."""
+    return Path("/.dockerenv").exists()
+
+
+# Our images' layout: the compose files mount the data root here, and the image holds the task configs here.
+CONTAINER_DATA_ROOT = Path("/data")
+CONTAINER_EXPERT_GROUPS = Path("/app/expert_groups")
+
+
+def in_container_layout() -> bool:
+    """Inside one of our images: in a container that has both. A checkout run in any other container keeps its own."""
+    return is_running_in_docker() and CONTAINER_DATA_ROOT.is_dir() and CONTAINER_EXPERT_GROUPS.is_dir()
+
+
+def find_project_root(start: Path | None = None) -> Path:
+    """Walk up until we see a repo/config marker."""
+    start = (start or Path(".")).expanduser().resolve(strict=True)
+    markers = (".git", "pyproject.toml", "requirements.txt")
+    for p in (start, *start.parents):
+        if any((p / m).exists() for m in markers):
+            return p
+    # Fallback: "up one level from connito/" (kept from original intent)
+    return start.parents[1]
+
+
+def bump_run_name(name: str) -> str:
+    """
+    Increment a run name in a `-vN` style.
+
+    "foo" -> "foo-v2"
+    "foo-v3" -> "foo-v4"
+    "test-1B" -> "test-1B-v2"
+    """
+    m = re.match(r"^(.*?)(?:-v(\d+))?$", name)
+    if not m:
+        return f"{name}-v2"
+    base, ver = m.group(1), m.group(2)
+    return f"{base}-v{int(ver) + 1}" if ver else f"{base}-v2"
+
+
+def norm_for_compare(v: Any) -> Any:
+    if isinstance(v, Path):
+        return v.as_posix()
+    return v
+
+
+def deep_compare(a: Any, b: Any, path: str = "") -> tuple[bool, list[str]]:
+    """
+    Deep-compare two nested structures.
+    Returns (ok, diffs) where diffs are human readable messages.
+    """
+    diffs: list[str] = []
+
+    if isinstance(a, dict) and isinstance(b, dict):
+        a_keys, b_keys = set(a), set(b)
+        missing = a_keys - b_keys
+        extra = b_keys - a_keys
+        if missing:
+            diffs.append(f"Missing keys in other at '{path}': {sorted(missing)}")
+        if extra:
+            diffs.append(f"Extra keys in other at '{path}': {sorted(extra)}")
+
+        ok = not missing and not extra
+        for k in sorted(a_keys & b_keys):
+            child_ok, child_diffs = deep_compare(a[k], b[k], f"{path}.{k}" if path else k)
+            ok = ok and child_ok
+            diffs.extend(child_diffs)
+        return ok, diffs
+
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        if len(a) != len(b):
+            return False, [f"Length mismatch at '{path}': other={len(b)} new={len(a)}"]
+        ok = True
+        for i, (ai, bi) in enumerate(zip(a, b, strict=False)):
+            child_ok, child_diffs = deep_compare(ai, bi, f"{path}[{i}]")
+            ok = ok and child_ok
+            diffs.extend(child_diffs)
+        return ok, diffs
+
+    a_n, b_n = norm_for_compare(a), norm_for_compare(b)
+    if a_n != b_n:
+        return False, [f"Mismatch at '{path}': other={b_n!r} new={a_n!r}"]
+    return True, []
+
+
+def ensure_dirs(paths: Iterable[Path]) -> None:
+    for p in paths:
+        p.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------
+# Base Config
+# ---------------------------
+class BaseConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    # Fields listed here are "locked" — they should stay at their defaults.
+    # Subclasses override this to declare which fields fall into category (2).
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset()
+
+    def __str__(self) -> str:
+        return self.to_json()
+
+    def to_dict(self) -> dict:
+        return self.model_dump(mode="python")
+
+    def to_json(self, **kwargs) -> str:
+        return self.model_dump_json(**kwargs, indent=4)
+
+    def locked_defaults(self) -> dict[str, Any]:
+        """Return {field_name: default_value} for all locked fields."""
+        result: dict[str, Any] = {}
+        for name in self._LOCKED_FIELDS:
+            info: FieldInfo = self.model_fields[name]
+            if info.default is not PydanticUndefined:
+                result[name] = info.default
+            elif info.default_factory is not None:
+                result[name] = info.default_factory()
+        return result
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> "BaseConfig":
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return cls.model_validate(data)
+
+
+# ---------------------------
+# Sections
+# ---------------------------
+class ChainCfg(BaseConfig):
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"netuid", "network"})
+    netuid: int = 102
+    uid: int = 0
+    hotkey_ss58: str = ""
+    coldkey_ss58: str = ""
+    ip: str = "0.0.0.0"
+    port: int = 8000
+    coldkey_name: str = "template_coldkey_name"
+    hotkey_name: str = "template_hotkey_name"
+    network: str = "archive"
+    lite_network: str = "finney"
+
+    def wallet(self) -> bittensor.Wallet:
+        return bittensor.Wallet(name=self.coldkey_name, hotkey=self.hotkey_name)
+
+
+class CycleCfg(BaseConfig):
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "cycle_length", "distribute_period", "train_period", "commit_period",
+        "submission_period", "validate_period", "merge_period", "owner_url",
+    })
+    cycle_length: int = 448 # 1.5 hr
+    distribute_period: int = 20 # 4 mins
+    train_period: int = 300 # 1 hr (will adjust to 500 mins when mature to align with Diloco)
+    commit_period: int = 10 # 2 mins
+    submission_period: int = 80 # 4 mins
+    validate_period: int = 10 # 10 mins
+    merge_period: int = 50 # 10 mins
+
+    owner_url: str = "https://cycle-api.connito.ai:443"
+    version_range_cycles: int = 3  # how many cycles back to accept checkpoints
+    # Owner-node API retry policy
+    api_timeout_sec: int = 10
+    api_retries: int = 5
+    api_backoff_sec: int = 2
+
+
+class RunCfg(BaseConfig):
+    run_name: str = "foundation"
+    root_path: Path = Field(default_factory=find_project_root)
+
+
+class ModelCfg(BaseConfig):
+    # `quantization` and `quantization_validator` are locked so the fleet cannot
+    # drift into validators scoring under different scopes, which breaks
+    # cross-validator val_loss comparability. `quantization_miner` is not locked
+    # — it only affects that miner's own VRAM. `family` is locked because every
+    # node must load the same checkpoint.
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "family", "quantization", "quantization_validator",
+    })
+    # A key of `modeling.families.FAMILIES`, which pins the checkpoint and its revision.
+    family: Literal["qwen3_5_moe", "deepseek_v2"] = "qwen3_5_moe"
+    foundation: bool = True
+    device: str = "cuda"
+    # fp8 weight-only storage for modules a role never trains. `quantization`
+    # picks the format, the per-role fields pick the scope. See
+    # connito/shared/modeling/quantization.py for the scope meanings.
+    quantization: str = "fp8"
+    # Not locked: a miner trades VRAM against training fidelity on its own box,
+    # and the choice affects nobody else's scoring.
+    quantization_miner: str = "all"
+    # Locked, so every validator scores under one scope and val_loss stays comparable across validators.
+    # Measured on Qwen vs bf16: "experts" +0.0006 nats, "all" +0.0018 for only 1.3 GiB less.
+    quantization_validator: str = "experts"
+
+    @model_validator(mode="after")
+    def _validate_quantization(self) -> ModelCfg:
+        if self.quantization not in ("off", "fp8"):
+            raise ValueError(
+                f"model.quantization must be 'off' or 'fp8', got {self.quantization!r}"
+            )
+        return self
+
+
+# A bare dataset column name. Deliberately narrower than Python
+# identifiers: no dots, no brackets, no leading digits.
+_COLUMN_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+class DatasetSourceCfg(BaseConfig):
+    path: str
+    name: str | None = None
+    weight: PositiveFloat = 1.0
+    text_column: str = "text"
+    # HF split to stream for this source. `None` keeps today's behaviour:
+    # the split is derived from the train/validation flag, which in
+    # practice is always "train" (no configured source ships a
+    # "validation" split, and the validation set is carved out of the
+    # same stream by the fractional index filter, not by a split name).
+    # Set it for repos whose split is named something else. Such repos
+    # exist and carry no `train` at all, so they cannot be streamed
+    # without this.
+    split: str | None = None
+    # Render each row into `text` with `str.format` instead of selecting
+    # a single column. Needed for instruction-shaped corpora, where the
+    # text a model should see is assembled from several columns and no
+    # one column is the text — such a corpus typically carries
+    # `instruction` / `input` / `output` and no `text` at all.
+    #
+    # `None` keeps `text_column` selection, which stays the default: the
+    # groups running in the field all have a real text column, and
+    # requiring a trivial `"{text}"` template of them would buy nothing.
+    #
+    # Placeholders are restricted to bare column names by
+    # `_validate_text_template` below — this string is task data that
+    # travels from the owner API to every miner and validator, so the
+    # grammar it may use is narrower than `str.format` allows.
+    text_template: str | None = None
+    # c4 replay rows: the miner trains its residual not to fire on them.
+    replay: bool = False
+    # Seeded shard pick without a `_KNOWN_SOURCES` entry: this source's shard
+    # list with a row count per shard, precomputed at the revision pinned in
+    # `eval_source_revision_pin` (required alongside this) and shipped with the
+    # task. The table is also the shard allowlist — a shard it omits is never
+    # picked. `_KNOWN_SOURCES` stays the fallback for sources that omit it.
+    eval_shard_rows: dict[str, PositiveInt] | None = None
+    # Cost cap on the in-shard skip, independent of shard size. See
+    # `_SourceShardPolicy.max_offset_rows` for what it trades away.
+    eval_max_offset_rows: PositiveInt | None = None
+
+    @model_validator(mode="after")
+    def _validate_non_empty(self):
+        if not self.path.strip():
+            raise ValueError("data.dataset_sources[].path cannot be empty.")
+        if not self.text_column.strip():
+            raise ValueError("data.dataset_sources[].text_column cannot be empty.")
+        if self.split is not None and not self.split.strip():
+            raise ValueError("data.dataset_sources[].split cannot be blank when set.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_text_template(self):
+        r"""Restrict `text_template` to `{column_name}` placeholders.
+
+        A template arrives as task data over the wire, so it is checked
+        here — at config load, before a round is running — rather than
+        being discovered mid-stream by whatever `str.format` does with
+        it. Everything rejected below either renders something the
+        author did not mean or raises an exception the rendering path
+        does not catch:
+
+          - a positional field (`{}` or `{0}`) indexes the format
+            arguments, not the row, and a row is passed by keyword;
+          - attribute or index access (`{a.__class__}`, `{a[0]}`)
+            reaches into the row's values and raises `AttributeError`
+            or `TypeError`, neither of which the renderer catches, so
+            it would kill a scored round mid-stream;
+          - a conversion or format spec (`{a!r}`, `{a:>1000000}`) hides
+            the column name from a naive `\{(\w+)\}` scan, and a width
+            is an arbitrary per-row allocation.
+        """
+        if self.text_template is None:
+            return self
+        if not self.text_template.strip():
+            raise ValueError("data.dataset_sources[].text_template cannot be blank when set.")
+
+        try:
+            fields = list(string.Formatter().parse(self.text_template))
+        except ValueError as e:
+            raise ValueError(f"data.dataset_sources[].text_template is not a valid format string: {e}") from e
+
+        named = 0
+        for _literal, field_name, format_spec, conversion in fields:
+            if field_name is None:  # trailing literal text
+                continue
+            if field_name == "" or field_name.isdigit():
+                raise ValueError(
+                    "data.dataset_sources[].text_template must not use positional fields "
+                    f"({{{field_name}}}); name the dataset column instead."
+                )
+            if not _COLUMN_NAME_RE.fullmatch(field_name):
+                raise ValueError(
+                    f"data.dataset_sources[].text_template placeholder {{{field_name}}} is not a bare "
+                    "column name; attribute and index access are not allowed."
+                )
+            if conversion is not None:
+                raise ValueError(
+                    f"data.dataset_sources[].text_template placeholder {{{field_name}}} must not use a "
+                    f"conversion (!{conversion})."
+                )
+            if format_spec:
+                raise ValueError(
+                    f"data.dataset_sources[].text_template placeholder {{{field_name}}} must not use a "
+                    f"format spec (:{format_spec})."
+                )
+            named += 1
+
+        if named == 0:
+            raise ValueError(
+                "data.dataset_sources[].text_template names no columns, so every row would render "
+                "to the same constant string."
+            )
+        return self
+
+
+class DataCfg(BaseConfig):
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir", "sequence_length"})
+    dataset_name: str = "allenai/c4"
+    data_dir: str | None = 'en'
+    dataset_sources: list[DatasetSourceCfg] | None = None
+    sequence_length: PositiveInt = 1024
+    per_device_train_batch_size: PositiveInt = 1
+    world_size: int = 10
+    rank: int = 1
+    dataset_class: str | None = None
+    vali_fraction: float = 0.1
+    # Per-source streaming-shuffle buffer used ONLY when a seed is passed
+    # (i.e. validator eval; miners pass seed=None and are unaffected). When
+    # > 0, each source is `ds.shuffle(seed=int_seed, buffer_size=N)`-d
+    # before interleave + fractional filter, which (a) shuffles HF shard
+    # order with the seed and (b) buffer-shuffles within the active read
+    # window. Without this, every eval round only reaches the head of each
+    # source's stream (~first few thousand rows), which is small enough to
+    # memorize and turns "score on validation" into "score on a fixed
+    # public subset."
+    #
+    # Default 50_000 (~200 MB RAM per source × 2 sources ≈ 400 MB total
+    # working set during eval) enables the protection out of the box.
+    # During the auto-upgrade rollout window, validators on the new
+    # default and validators still on the old default will draw
+    # different eval batches and produce non-comparable losses for the
+    # same `combined_seed` — same brief consensus-divergence shape as
+    # the recent block-hash seed mix-in. Operators who need to opt out
+    # for memory reasons can set this to 0 in their config.
+    eval_source_shuffle_buffer: int = 50_000
+    # Per-source random read offset applied AFTER the buffer shuffle. When
+    # > 0, each source is `ds.skip(rng.randrange(0, N))`-d so the validator
+    # reads from a random DEPTH into the (already-randomly-chosen) lead
+    # shard, not always from row 0.
+    #
+    # Why both this and `eval_source_shuffle_buffer` are needed:
+    #   - `.shuffle(seed, buffer_size=B)` permutes which shard leads each
+    #     round AND buffer-shuffles within a B-wide window. But the
+    #     validator only consumes ~5,000 positions per round, so the read
+    #     never advances past the first ~B rows of the lead shard. Across
+    #     seeds you get different shards' HEADS — not different rows of
+    #     the same shard's body.
+    #   - `.skip(N)` slides the buffer window N rows deep into the lead
+    #     shard, so the reachable pool spans the BODY of each shard. The
+    #     reachable set then grows along two axes: (shard permuted to lead)
+    #     and (offset into that shard).
+    #
+    # Cost: `.skip(N)` on a streaming dataset is O(N) decode-and-discard,
+    # paid once per source per round at eval start. 50_000 adds a few
+    # seconds per round. Tune down if too slow; tune up for even less
+    # predictability. Same coordinated-rollout discipline as
+    # `eval_source_shuffle_buffer` — validators on different defaults
+    # diverge for one round, then re-converge.
+    eval_source_skip_max: int = 50_000
+    # Switch the validator eval path from the legacy
+    # `.shuffle(seed) + .skip(small)` window (reachable region capped
+    # at first ~`shuffle_buffer + skip_max` rows of every shard) to
+    # seeded shard-pick + hash-mod in-shard offset. When True, the
+    # reachable region per round is the WHOLE chosen shard; across
+    # rotating seeds, every shard × every row is eventually reachable.
+    # `eval_source_shuffle_buffer` and `eval_source_skip_max` are
+    # ignored on the new path.
+    #
+    # See `connito/shared/eval_shard_pick.py` for the threat model,
+    # consensus assumptions (revision pin per source, deterministic
+    # sort, per-source safe-floor + verified-spot-check policy) and
+    # the policy registry that must contain an entry for every
+    # configured source.
+    #
+    # Default ON. Same coordinated-rollout discipline as the
+    # earlier shuffle/skip bumps: flip together with all validators
+    # at a gated chain epoch, otherwise losses diverge for the
+    # transition round and weight consensus breaks.
+    eval_source_seeded_shard_pick: bool = True
+    # Per-source HF commit SHA to pin shard listing + shard reads to.
+    # Keys are the source `path` (e.g. `"allenai/c4"`), values are
+    # 40-char SHAs. When omitted for a source, the policy's default
+    # `revision` in `eval_shard_pick._KNOWN_SOURCES` is used.
+    #
+    # Required for genuine consensus safety — `"main"` is a moving
+    # target and a mid-rollout HF re-upload would cause two
+    # validators to pick different rows for the same seed.
+    eval_source_revision_pin: dict[str, str] | None = None
+    # --- Eval-stream data-quality gates (validator eval path only; the
+    # miner training stream passes seed=None and is unaffected). Both
+    # are deterministic, so all validators on the same version keep
+    # identical eval batches. Same coordinated-rollout discipline as
+    # the other eval_source_* knobs.
+    #
+    # Drop rows whose text is shorter than this many characters after
+    # strip(). Motivated by Multi_Legal_Pile all_all, where 38% of
+    # streamed rows have empty text: those tokenize to all-padding
+    # sequences whose loss is NaN, silently shrinking the scored eval
+    # sample. 0 disables.
+    eval_min_text_chars: int = 200
+    # Keep only the first row per distinct text prefix of this many
+    # characters. Templated corpora repeat opening boilerplate across
+    # documents (measured: 75% of non-empty Multi_Legal_Pile rows share
+    # an identical 200-char prefix); scoring duplicates hands
+    # template-memorizing miners near-zero loss on "unseen" rows.
+    # 0 disables.
+    eval_dedup_prefix_chars: int = 200
+
+    @model_validator(mode="after")
+    def _validate_dataset_sources(self):
+        if self.dataset_sources is not None and len(self.dataset_sources) == 0:
+            raise ValueError("data.dataset_sources must contain at least one source when provided.")
+        # A shard table is only meaningful at the revision it was counted
+        # against: `main` moves, and a re-upload would leave every validator
+        # picking rows by a table that no longer describes the files. Refuse
+        # the pair here, where a task switch rolls back and leaves the node on
+        # the task it has, rather than mid-round at the first pick.
+        for source in self.dataset_sources or []:
+            if source.eval_shard_rows and source.path not in (self.eval_source_revision_pin or {}):
+                raise ValueError(
+                    f"data.dataset_sources[{source.path!r}] sets eval_shard_rows but has no "
+                    f"data.eval_source_revision_pin entry. A shard table is valid only at the "
+                    f"revision its rows were counted at."
+                )
+        return self
+
+
+class DataloaderCfg(BaseConfig):
+    world_size: int = 10  # number of distinct data shards (typically = number of validators)
+
+
+class OptimizerCfg(BaseConfig):
+    lr: float = 1e-4
+    outer_lr: float = 0.7
+    outer_momentum: float = 0.9
+    # Inner AdamW optimizer-state precision (exp_avg + exp_avg_sq):
+    #   32 -> torch.optim.AdamW, fp32 state (default), 8 bytes per trainable param.
+    #    8 -> bitsandbytes AdamW, 8-bit blockwise-quantized state (~4x smaller);
+    #         an alternative when running fp32 at a larger sequence_length.
+    # bitsandbytes has no 16-bit AdamW state, so only 8 or 32 are valid.
+    adamw_optim_bits: int = 32
+
+
+class ParallelismCfg(BaseConfig):
+    # Rows per forward. 2 x 2 fits the L40S at seq 4096 under either fp8 scope; "all" also fits 4 x 1, barely.
+    micro_batch_size: PositiveInt = 2
+    gradient_accumulation_steps: PositiveInt = 2
+    global_opt_interval: PositiveInt = 100
+    world_size: PositiveInt = 1
+    port: PositiveInt = 29500
+    ip_address: str = "127.0.0.1"
+
+    @staticmethod
+    def cuda_device_count_safe() -> int:
+        try:
+            return int(torch.cuda.device_count())
+        except Exception:
+            return 0
+
+
+class ScheduleCfg(BaseConfig):
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"total_steps"})
+    warmup_steps: int = 0
+    total_steps: PositiveInt = 88_000
+
+
+class CheckpointCfg(BaseConfig):
+    # Locked so every validator resumes local training state on restart —
+    # uniform behavior across the fleet. On load it is auto-reset to the
+    # default (True); an operator who needs a clean cold-start (e.g. recovering
+    # from a corrupt/incompatible checkpoint) should point at a fresh, empty
+    # checkpoint_path rather than disabling resume, which is no longer honored.
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"resume_from_ckpt"})
+    resume_from_ckpt: bool = True
+    base_checkpoint_path: Path = Path("checkpoints/miner")
+    checkpoint_path: Path | None = None
+    checkpoint_interval: PositiveInt | None = None
+    full_validation_interval: PositiveInt | None = None
+    checkpoint_topk: PositiveInt = 2
+    validator_checkpoint_path: Path = Path("validator_checkpoint")
+    # Legacy compatibility knob. Miner checkpoint downloads pull from HF only,
+    # but older configs may still include this field.
+    download_concurrency: PositiveInt = 1
+    # When True, skip the chain-fetch of the validator's latest checkpoint
+    # AND the on-disk overlay in get_model_from_checkpoint. The model returns
+    # with pretrained base weights only — useful for cold-start experiments
+    # (LR sweeps starting from the base backbone). Overrides resume_from_ckpt.
+    use_pretrained_only: bool = False
+    # When True (default) the miner's inner-opt-step loop calls the
+    # "(5) Reload Model" branch that re-runs setup_training if it finds a
+    # newer checkpoint on disk. Under use_pretrained_only=True this reload
+    # rebuilds from pretrained every step and discards optimizer progress,
+    # so val_loss stays flat. Set to False for standalone smoke/train runs
+    # where you don't want the miner reacting to on-disk validator
+    # checkpoints. Production miners should leave this True.
+    enable_peer_resync: bool = True
+
+
+class HfCfg(BaseConfig):
+    # HuggingFace Hub is the checkpoint transport: validators upload the
+    # checkpoint directory, commit the revision SHA to the Bittensor chain,
+    # and miners download from the returned repo@revision.
+    #
+    # checkpoint_repo: the HF repo the validator pushes to. Must exist and
+    # be writable by the HF_TOKEN. If omitted, runtime will derive
+    # {authenticated_hf_user}/{default_repo_name}. The on-chain advertised
+    # repo can diverge from this upload target; validator code currently
+    # derives the advertised repo as {owner}/cycle from the upload repo.
+    checkpoint_repo: str | None = None
+    default_repo_name: str = "co"
+    # Read from HF_TOKEN env at runtime — not stored in config YAML.
+    # Validators need write access; miners need read access (or public repo).
+    token_env_var: str = "HF_TOKEN"
+    # Separate repo the round podium is published to, off unless set. Keep it
+    # distinct from `checkpoint_repo`: podium commits would otherwise advance
+    # `main` on the repo miners fetch from, and the squash below rewrites
+    # history, which must never touch the distribution repo.
+    archive_repo: str | None = None
+    archive_keep_rounds: PositiveInt = 3
+    # Deleting a round folder leaves its LFS bytes in history; squashing is
+    # what reclaims them. Costs every prior revision of the archive repo,
+    # which is why it is confined to a repo nothing pins.
+    archive_squash: bool = True
+
+    @staticmethod
+    def _normalize_checkpoint_repo_value(value: str | None) -> str | None:
+        checkpoint_repo = (value or "").strip()
+        if checkpoint_repo and "/" not in checkpoint_repo:
+            raise ValueError("hf.checkpoint_repo must be '<namespace>/<repo>'")
+        return checkpoint_repo or None
+
+    @staticmethod
+    def _normalize_default_repo_name(value: str) -> str:
+        default_repo_name = value.strip()
+        if not default_repo_name:
+            raise ValueError("hf.default_repo_name cannot be empty")
+        if "/" in default_repo_name:
+            raise ValueError("hf.default_repo_name must be a repo name, not '<namespace>/<repo>'")
+        return default_repo_name
+
+    def resolve_upload_repo(self, derived_repo: str | None = None) -> str | None:
+        return self.checkpoint_repo or self._normalize_checkpoint_repo_value(derived_repo)
+
+    def advertised_repo_id(self, upload_repo: str | None) -> str | None:
+        if not upload_repo:
+            return None
+        return upload_repo
+
+    def uses_explicit_checkpoint_repo(self) -> bool:
+        return self.checkpoint_repo is not None
+
+    @model_validator(mode="after")
+    def _validate_hf_repo_settings(self):
+        self.checkpoint_repo = self._normalize_checkpoint_repo_value(self.checkpoint_repo)
+        self.default_repo_name = self._normalize_default_repo_name(self.default_repo_name)
+        return self
+
+
+class LoggingCfg(BaseConfig):
+    log_wandb: bool = False
+    wandb_project_name: str = "test-moe"
+    wandb_resume: bool = False
+    wandb_full_id: str = ""
+    wandb_partial_id: list[str | None] = Field(default_factory=list)
+    base_metric_path: Path = Path("metrics")
+    metric_path: Path | None = None
+    metric_interval: PositiveInt | None = None
+
+
+class ValidatorCheckpointCfg(CheckpointCfg):
+    base_checkpoint_path: Path = Path("checkpoints/validator")
+    miner_submission_path: Path = Path("miner_submission")
+    cleanup_stale_temporary_checkpoints: bool = True
+    miner_submission_max_age_cycles: PositiveFloat = 1.5
+
+
+class OwnerCheckpointCfg(CheckpointCfg):
+    base_checkpoint_path: Path = Path("checkpoints/owner")
+
+
+class ResidualCfg(BaseConfig):
+    """The task's residual experts: K per MoE block, gate threshold A and temperature τ."""
+
+    k: PositiveInt
+    threshold: float = Field(gt=0, lt=1)  # compared with a sigmoid output
+    temperature: PositiveFloat
+
+    @model_validator(mode="after")
+    def _gate_can_open(self) -> ResidualCfg:
+        # q ≥ sigmoid(−A/τ), which is exactly 0 in fp32 from about 88; a token with q = 0 gives its expert no gradient.
+        ratio = self.threshold / self.temperature
+        if ratio >= 80:
+            raise ValueError(f"residual threshold / temperature must be below 80, got {ratio:g}")
+        return self
+
+
+class ExpertCfg(BaseConfig):
+    data: DataCfg = Field(default_factory=DataCfg)
+    # Required: it is the expert group every chain commit names, so a forgotten one must not default into a slot.
+    group_id: NonNegativeInt
+    residual: ResidualCfg
+
+
+class TaskCfg(BaseConfig):
+    # `expert_group_name` is unlocked but still not the operator's to pick:
+    # entrypoints resolve it from the owner API and pass it to `from_path`,
+    # which applies it before anything is derived from it. The lock stopped an
+    # operator drifting away from the fleet (validators only score miners whose
+    # chain commit carries a matching `expert_group`); that guarantee is
+    # unchanged, its authority just moved from a code constant to the API, so a
+    # new task no longer needs a release. The value here is the fallback used
+    # when the API is unreachable.
+    expert_group_name: str = "exp_pmc_residual"
+    base_path: Path = Path("expert_groups")
+    path: Path | None = None
+    exp: ExpertCfg | None = None  # set from the task's config.yaml by model_post_init
+
+
+# ---------------------------
+# Top-level config
+# ---------------------------
+class WorkerConfig(BaseConfig):
+    """
+    Centralized training/eval configuration for mycelia runs.
+
+    Notes
+    -----
+    - This class derives paths and can optionally bump run_name if an on-disk config differs.
+    - Side-effects (mkdir, wallet lookup, task yaml load) are done in model_post_init.
+    """
+
+    run: RunCfg = Field(default_factory=RunCfg)
+    chain: ChainCfg = Field(default_factory=ChainCfg)
+    model: ModelCfg = Field(default_factory=ModelCfg)
+    ckpt: CheckpointCfg = Field(default_factory=CheckpointCfg)
+    hf: HfCfg = Field(default_factory=HfCfg)
+    sched: ScheduleCfg = Field(default_factory=ScheduleCfg)
+    log: LoggingCfg = Field(default_factory=LoggingCfg)
+    opt: OptimizerCfg = Field(default_factory=OptimizerCfg)
+    cycle: CycleCfg = Field(default_factory=CycleCfg)
+    task: TaskCfg = Field(default_factory=TaskCfg)
+    dataloader: DataloaderCfg = Field(default_factory=DataloaderCfg)
+
+    # -----------------------
+    # Lifecycle
+    # -----------------------
+    def model_post_init(self, __context: Any) -> None:
+        # Fill keys (best-effort)
+        self._fill_wallet_data()
+
+        # Inside one of our images, override root to its mount points (in_container_layout). Any other container,
+        # such as a checkout run in a plain python image, keeps the repo's own layout.
+        if in_container_layout():
+            self.run.root_path = CONTAINER_DATA_ROOT
+            self.task.base_path = CONTAINER_EXPERT_GROUPS
+            logger.info("Docker detected — root_path set to /data")
+        elif is_running_in_docker():
+            logger.info("Docker detected without /data and /app/expert_groups — keeping the repo's layout")
+
+        # Derive paths
+        self._refresh_paths()
+
+        # Load per-task overrides. A task this node has not got, or cannot load
+        # (one materialized for an older release), falls back to the shipped
+        # default here, at construction, where raising would be a crash loop
+        # before anything can ask the API or fetch the task. A live switch has
+        # a task to stay on, so `switch_active_task` gets no such fallback.
+        try:
+            self._update_by_task()
+        # YAMLError and UnicodeDecodeError: a truncated, hand-edited or corrupt config.yaml.
+        except (FileNotFoundError, ValidationError, yaml.YAMLError, UnicodeDecodeError) as e:
+            fallback = type(self.task).model_fields["expert_group_name"].default
+            if self.task.expert_group_name == fallback:
+                raise
+            logger.error(
+                "Task not loadable — falling back to the shipped default",
+                task=self.task.expert_group_name, error=str(e), fallback=fallback,
+            )
+            self._update_by_task(expert_group_name=fallback)
+
+        # Create directories
+        self._ensure_runtime_dirs()
+
+    # -----------------------
+    # Derived paths / IO
+    # -----------------------
+    def _refresh_paths(self) -> None:
+        """Derive all runtime paths from root_path + class defaults.
+
+        Always computes from the original default values so this method
+        is idempotent — safe to call multiple times without stacking prefixes.
+        """
+        root = self.run.root_path
+        ckpt_cls = type(self.ckpt)
+        log_cls = type(self.log)
+
+        # ckpt paths — always start from the class default (relative)
+        base_ckpt = root / Path(ckpt_cls.model_fields["base_checkpoint_path"].default)
+        self.ckpt.base_checkpoint_path = base_ckpt
+        # Include expert_group_name in the leaf so switching the active expert
+        # group automatically writes/resumes from a fresh, group-isolated
+        # directory — no run_name bump needed, and no risk of resuming another
+        # group's (incompatible) checkpoints. Re-derived after locked-field
+        # reset via _update_by_task -> _refresh_paths, so the path always
+        # tracks the *effective* group.
+        self.ckpt.checkpoint_path = (
+            base_ckpt
+            / self.chain.coldkey_name
+            / self.chain.hotkey_name
+            / self.run.run_name
+            / self.task.expert_group_name
+        )
+        # The miner's cache of downloaded validator baselines. Group in the
+        # leaf for the same reason as above: after a task switch the picker
+        # must not find the previous task's shards first.
+        self.ckpt.validator_checkpoint_path = (
+            base_ckpt
+            / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
+            / self.task.expert_group_name
+        )
+
+        # logging paths
+        base_metric = root / Path(log_cls.model_fields["base_metric_path"].default)
+        self.log.base_metric_path = base_metric
+        self.log.metric_path = base_metric / f"{self.run.run_name}.csv"
+
+        # task paths
+        self.task.base_path = root / self.task.base_path
+        self.task.path = self.task.base_path / self.task.expert_group_name
+
+        # optional ckpt sub-paths — always from class default + base_ckpt
+        if hasattr(self.ckpt, "miner_submission_path"):
+            self.ckpt.miner_submission_path = (
+                base_ckpt / Path(ckpt_cls.model_fields["miner_submission_path"].default)
+            )
+
+    def _ensure_runtime_dirs(self) -> None:
+        assert self.ckpt.checkpoint_path is not None
+        assert self.task.path is not None
+        assert self.log.metric_path is not None
+
+        dirs = [
+            self.task.base_path,
+            self.task.path,
+            self.ckpt.base_checkpoint_path,
+            self.ckpt.checkpoint_path,
+            self.log.base_metric_path,
+            self.ckpt.validator_checkpoint_path,
+        ]
+        ensure_dirs(dirs)
+
+    def _update_by_task(self, expert_group_name: str | None = None) -> None:
+        if expert_group_name:
+            self.task.expert_group_name = expert_group_name
+            self._refresh_paths()
+
+        assert self.task.path is not None
+        self.task.exp = ExpertCfg.from_path(self.task.path / "config.yaml")  # type: ignore
+        self._refresh_paths()
+
+    def switch_active_task(self, expert_group_name: str) -> None:
+        """Re-point a live config at a different task, all-or-nothing.
+
+        `_update_by_task` assigns the name and re-derives paths *before* it
+        reads the new task's `config.yaml`, so a task this node does not have
+        on disk would strand the new name against the old `task.exp` — the
+        `5e6ab4c` shape, training one dataset while committing another
+        group's id. Roll back and re-raise instead.
+
+        `_ensure_runtime_dirs` because both group-scoped paths are new.
+        """
+        previous_name = self.task.expert_group_name
+        previous_exp = self.task.exp
+        try:
+            self._update_by_task(expert_group_name=expert_group_name)
+        except Exception:
+            self.restore_task(previous_name, previous_exp)
+            raise
+        self._ensure_runtime_dirs()
+
+    def restore_task(self, expert_group_name: str, exp: ExpertCfg) -> None:
+        """Put back a task this config was on, from memory: no file is read, so it cannot fail."""
+        self.task.expert_group_name = expert_group_name
+        self.task.exp = exp
+        self._refresh_paths()
+
+    def _fill_wallet_data(self) -> None:
+        if self.chain.hotkey_ss58 and self.chain.coldkey_ss58:
+            logger.info(
+                "Wallet data already present in config, skipping chain lookup",
+                hotkey_ss58=self.chain.hotkey_ss58,
+                coldkey_ss58=self.chain.coldkey_ss58,
+                uid=self.chain.uid,
+            )
+            return
+
+        wallet = self.chain.wallet()
+        logger.info("Resolving wallet data from chain",
+                     coldkey=self.chain.coldkey_name,
+                     hotkey=self.chain.hotkey_name,
+                     network=self.chain.network)
+        subtensor = bittensor.Subtensor(network=self.chain.network)
+        try:
+            self.chain.hotkey_ss58 = wallet.hotkey.ss58_address
+            self.chain.coldkey_ss58 = wallet.coldkeypub.ss58_address
+            self.chain.uid = get_metagraph(subtensor, self.chain.netuid).hotkeys.index(self.chain.hotkey_ss58)
+        except (FileNotFoundError, KeyfileError) as e:
+            logger.warning(
+                "Cannot find wallet keys; check coldkey/hotkey names or pass --hotkey_name/--coldkey_name",
+                coldkey_name=self.chain.coldkey_name,
+                hotkey_name=self.chain.hotkey_name,
+                error=str(e),
+            )
+
+    # -----------------------
+    # Locked-field enforcement
+    # -----------------------
+    # Sub-config sections that participate in locked-field checks.
+    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "sched", "ckpt", "evaluation", "task")
+
+    @classmethod
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        active_task: str | None,
+        auto_update_config: bool = False,
+    ) -> "WorkerConfig":
+        """Load a config, with the owner API's answer supplied by the caller.
+
+        `active_task` has no default so a new entrypoint cannot silently skip
+        resolving it: pass `task_sync.resolve_active_task_name(path)`, or None
+        for tooling that does not run a node. It is applied *before*
+        construction, so every derived path tracks the right task first time
+        and there is nothing to re-derive afterwards.
+        """
+        path = Path(path)
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if active_task:
+            data.setdefault("task", {})["expert_group_name"] = active_task
+        instance = cls(**data)
+        instance._prompt_new_fields(yaml_data=data, config_path=path, auto_update=auto_update_config)
+        instance.check_and_prompt_locked(config_path=path, auto_update=auto_update_config)
+        return instance
+
+    def _prompt_new_fields(
+        self,
+        yaml_data: dict,
+        config_path: Path | None = None,
+        auto_update: bool = False,
+    ) -> None:
+        """
+        Detect fields that exist in the code but are missing from the config yaml.
+        Prompt the user to accept the default or enter a custom value.
+        """
+        if not auto_update and not sys.stdin.isatty():
+            return
+
+        changed = False
+        for section_name in self._LOCKED_SECTIONS:
+            sub_cfg = getattr(self, section_name, None)
+            if not isinstance(sub_cfg, BaseConfig):
+                continue
+            yaml_section = yaml_data.get(section_name, {}) or {}
+
+            for field_name, field_info in sub_cfg.model_fields.items():
+                if field_name in yaml_section:
+                    continue
+                # Field is missing from yaml — it's using the code default
+                if field_info.default is PydanticUndefined and field_info.default_factory is None:
+                    continue  # required field with no default, pydantic would have errored
+
+                default_val = field_info.default if field_info.default is not PydanticUndefined else field_info.default_factory()
+
+                if auto_update:
+                    logger.info(
+                        "New config field — using default",
+                        field=f"{section_name}.{field_name}",
+                        default=default_val,
+                    )
+                    changed = True
+                else:
+                    print(f"\n[{section_name}.{field_name}] new field not in config file")
+                    answer = input(f"  Enter value (or press Enter for default: {default_val!r}): ").strip()
+                    if answer:
+                        # Try to cast to the field's type
+                        try:
+                            ann = field_info.annotation
+                            if ann is int or ann is float:
+                                answer = ann(answer)
+                            elif ann is bool:
+                                answer = answer.lower() in ("true", "1", "yes")
+                            elif ann is Path:
+                                answer = Path(answer)
+                        except (ValueError, TypeError):
+                            pass
+                        setattr(sub_cfg, field_name, answer)
+                    changed = True
+
+        if changed and config_path is not None:
+            data = self.model_dump(exclude={"task": {"exp"}})
+            data = self._strip_root(data, self.run.root_path)
+            data = convert_to_str(data)
+            try:
+                with open(config_path, "w", encoding="utf-8") as f:
+                    yaml.dump(data, f, sort_keys=False)
+                logger.info("Wrote updated config (new fields added)", path=str(config_path))
+            except OSError as e:
+                logger.warning(
+                    "Could not persist new fields — config path is read-only; defaults applied in memory only",
+                    path=str(config_path),
+                    error=str(e),
+                )
+
+    def check_and_prompt_locked(self, config_path: Path | None = None, auto_update: bool = False) -> None:
+        """
+        For each locked field in category-(2) sub-configs, compare the loaded
+        value against the class default.  When they differ:
+        - auto_update=True: reset to default without prompting (for systemd / non-interactive).
+        - stdin is a TTY: ask the user whether to reset.
+        - otherwise: skip silently.
+        """
+        if not auto_update and not sys.stdin.isatty():
+            return
+
+        # Build flat list of (dotted_path, sub_cfg_object) to check.
+        # Top-level sections come from _LOCKED_SECTIONS; task.exp.data is added separately.
+        candidates: list[tuple[str, BaseConfig]] = [
+            (section, getattr(self, section))
+            for section in self._LOCKED_SECTIONS
+            if isinstance(getattr(self, section, None), BaseConfig)
+        ]
+        changed = False
+        for label, sub_cfg in candidates:
+            for field_name, default_val in sub_cfg.locked_defaults().items():
+                current_val = getattr(sub_cfg, field_name)
+                if norm_for_compare(current_val) == norm_for_compare(default_val):
+                    continue
+                if auto_update:
+                    logger.info(
+                        "auto_update_config: resetting locked field to default",
+                        field=f"{label}.{field_name}",
+                        old_value=current_val,
+                        new_value=default_val,
+                    )
+                    setattr(sub_cfg, field_name, default_val)
+                    changed = True
+                else:
+                    print(f"\n[{label}.{field_name}] current value from local config file : {current_val!r}")
+                    print(f"[{label}.{field_name}] expected default value according to chain: {default_val!r}")
+                    answer = input("  Reset to default? [y/N] ").strip().lower()
+                    if answer == "y":
+                        setattr(sub_cfg, field_name, default_val)
+                        changed = True
+
+        if changed and config_path is not None:
+            data = self.model_dump(exclude={"task": {"exp"}})
+            data = self._strip_root(data, self.run.root_path)
+            data = convert_to_str(data)
+            try:
+                with open(config_path, "w", encoding="utf-8") as f:
+                    yaml.dump(data, f, sort_keys=False)
+                logger.info("Wrote updated config (locked fields reset)", path=str(config_path))
+            except OSError as e:
+                logger.warning(
+                    "Could not persist locked-field reset — config path is read-only; reset applied in memory only",
+                    path=str(config_path),
+                    error=str(e),
+                )
+
+    # -----------------------
+    # Config equivalence / versioning
+    # -----------------------
+    def same_as(self, other: dict) -> bool:
+        ok, diffs = deep_compare(self.to_dict(), other)
+        for d in diffs:
+            logger.debug("Config mismatch", diff=d)
+        return ok
+
+    def resolve_run_name_against_disk(
+        self,
+        *,
+        overwrite: bool = False,
+        bump_if_diff: bool = True,
+    ) -> "WorkerConfig":
+        """
+        Compare to on-disk config at <checkpoint_path>/config.yaml.
+        - If missing: returns self.
+        - If same: returns self.
+        - If different:
+            * overwrite=True -> return WorkerConfig(**other_dict) (matches original behavior)
+            * else bump_if_diff=True -> bump run_name and return self
+            * else -> return self unchanged
+        """
+        assert self.ckpt.checkpoint_path is not None
+        config_path = self.ckpt.checkpoint_path / "config.yaml"
+        if not config_path.exists():
+            return self
+
+        with open(config_path, encoding="utf-8") as f:
+            other = yaml.safe_load(f) or {}
+
+        if self.same_as(other):
+            return self
+
+        if overwrite:
+            logger.info("Overwriting existing run_name with on-disk config.")
+            return self.__class__(**other)  # preserve subclass type
+
+        if bump_if_diff:
+            self.run.run_name = bump_run_name(self.run.run_name)
+            self._refresh_paths()
+            logger.info("Bumped run_name due to config differences.", run_name=self.run.run_name)
+
+        return self
+
+    # -----------------------
+    # Persistence
+    # -----------------------
+    @staticmethod
+    def _strip_root(data: dict, root: Path) -> dict:
+        """Recursively strip *root* prefix from Path-like string values so the
+        YAML stays portable across host and Docker environments."""
+        root_str = root.as_posix().rstrip("/") + "/"
+
+        def _walk(obj):
+            if isinstance(obj, dict):
+                return {k: _walk(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_walk(i) for i in obj]
+            if isinstance(obj, Path):
+                try:
+                    return obj.relative_to(root)
+                except ValueError:
+                    return obj
+            if isinstance(obj, str) and obj.startswith(root_str):
+                return obj[len(root_str):]
+            return obj
+
+        return _walk(data)
+
+    def write(self) -> None:
+        """
+        Persist this config to `<checkpoint_path>/config.yaml`.
+        Excludes task.exp (loaded from task config file) and task.base_path /
+        task.path (derived at runtime, remapped in Docker — should not be
+        persisted so the YAML stays portable across host and container).
+        All remaining paths are written relative to root_path.
+        """
+        assert self.ckpt.checkpoint_path is not None
+        data = self.model_dump(exclude={
+            "run": {"root_path"},
+            "task": {"exp", "base_path", "path"},
+        })
+        data = self._strip_root(data, self.run.root_path)
+        data = convert_to_str(data)
+
+        ensure_dirs([self.ckpt.checkpoint_path])
+        target = self.ckpt.checkpoint_path / "config.yaml"
+
+        with fsspec.open(target.as_posix(), "w", encoding="utf-8") as f:
+            yaml.dump(data, f, sort_keys=False)
+
+        logger.info("Wrote config", path=str(target))
+
+
+class MinerConfig(WorkerConfig):
+    role: str = "miner"
+    local_par: ParallelismCfg = Field(default_factory=ParallelismCfg)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accumulation_from_before_micro_batch(cls, data: Any) -> Any:
+        """A YAML from before micro_batch_size accumulated 1-row micro-batches; take the new default instead."""
+        local_par = data.get("local_par") if isinstance(data, dict) else None
+        if not isinstance(local_par, dict) or "micro_batch_size" in local_par:
+            return data
+        if "gradient_accumulation_steps" in local_par:
+            logger.warning(
+                "Ignoring local_par.gradient_accumulation_steps from before micro_batch_size; add "
+                "local_par.micro_batch_size to keep your own gradient_accumulation_steps",
+                ignored=local_par["gradient_accumulation_steps"],
+            )
+        # Persisted by from_path's rewrite; without auto_update or a TTY it is redone on every load.
+        return data | {"local_par": {k: v for k, v in local_par.items() if k != "gradient_accumulation_steps"}}
+
+    @model_validator(mode="after")
+    def _derive_all(self):
+        goi = self.local_par.global_opt_interval
+        frac = 0.2
+
+        if self.ckpt.checkpoint_interval is None:
+            self.ckpt.checkpoint_interval = max(1, round(goi * frac))
+        if self.ckpt.full_validation_interval is None:
+            self.ckpt.full_validation_interval = max(1, round(goi * frac))
+        if self.log.metric_interval is None:
+            self.log.metric_interval = max(1, round(goi * frac))
+
+        return self
+
+    @model_validator(mode="after")
+    def _validate_quantization_miner(self):
+        # Only a miner reads it. quantization_validator is locked: a stale value is reset on load, not refused.
+        from connito.shared.modeling.quantization import SCOPES  # quantization -> families -> config
+
+        if self.model.quantization_miner not in SCOPES:
+            raise ValueError(f"model.quantization_miner must be one of {SCOPES}, got {self.model.quantization_miner!r}")
+        return self
+
+
+class ValidatorRunCfg(RunCfg):
+    averager_step_timeout_sec: int = 60  # seconds to wait for averager group formation (1 min)
+    averager_step_max_retries: int = 2  # max retry attempts for averager step
+    record_cuda_mem_history: bool = False  # enable torch.cuda.memory._record_memory_history (leaks RAM; profiling only)
+
+
+class EvalCfg(BaseConfig):
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n",
+        "max_replay_loss_increase", "replay_loss_weight", "task_usage_weight", "task_usage_target",
+        "replay_usage_weight",
+    })
+    top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
+    top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
+    score_window: int = 8            # max number of phases (points) retained per miner in MinerScoreAggregator
+    foreground_top_n: PositiveInt = 5
+    background_worker_enabled: bool = True
+    per_miner_download_timeout_sec: PositiveInt = 180
+    per_miner_eval_timeout_sec: PositiveInt = 300
+    # c4 isolation gate: a miner whose replay loss rises more than this above the base's is never ranked.
+    max_replay_loss_increase: NonNegativeFloat = 0.02
+    # raw = (task_base − task) − a·max(0, c4 − c4_base) − b·|task_usage − target| − c·c4_usage
+    # score = raw − the base's raw on its own baseline evals (only its usage terms), so the base scores 0
+    replay_loss_weight: NonNegativeFloat = 1.0  # a
+    task_usage_weight: NonNegativeFloat = 1.0  # b
+    task_usage_target: NonNegativeFloat = 0.2  # target
+    replay_usage_weight: NonNegativeFloat = 1.0  # c
+    # Round-group construction scheme. When true, Round.freeze() partitions
+    # the roster into validation Groups A (3) / B (10) / C (17) with
+    # |A|+|B|=13, holds B and C for 8 cycles, and emits weight Group 1
+    # (98%) / Group 2 (2%). Default ON; set False to opt back into the
+    # legacy assignment-driven roster (kept as a rollback path until the
+    # new scheme is validated on mainnet for several cohorts).
+    # Spec: _specs/round-group-construction-scheme.md.
+    enable_round_group_construction: bool = True
+    cohort_state_filename: str = "cohort_state.json"
+    cohort_window_cycles: int = 8                # 8-cycle hold per spec
+    weight_group_1_size: int = 3
+    weight_group_1_share: float = 0.98
+    weight_group_2_size: int = 5
+    weight_group_2_share: float = 0.02
+    validation_group_a_size: int = 3
+    validation_group_ab_total: int = 13          # |A| + |B| invariant
+    validation_group_c_size: int = 17
+    group_a_min_consensus: int = 1               # ≥ 1 qualified validator
+    group_a_min_weight_per_validator: float = 0.03   # > 3% from at least one validator
+    # When a miner's committed HF repo/revision/file is definitively not
+    # retrievable (deleted, private, gated, revision rewritten) AND an
+    # unauthenticated probe confirms it is not publicly fetchable, treat
+    # the miss as the miner's fault: record score=0 for the round instead
+    # of preserving the prior rolling average. Closes the
+    # "delete-your-model-and-keep-earning" hole; set False to restore the
+    # legacy EMA-preserving behavior.
+    repo_unavailable_is_miner_fault: bool = True
+
+
+class ValidatorConfig(WorkerConfig):
+    role: str = "validator"
+    ckpt: ValidatorCheckpointCfg = Field(default_factory=ValidatorCheckpointCfg)
+    run: ValidatorRunCfg = Field(default_factory=ValidatorRunCfg)
+    evaluation: EvalCfg = Field(default_factory=EvalCfg)
+
+    def write_docker_env(self, env_path: Path | None = None) -> None:
+        """Generate a Docker compose .env file from the current config."""
+        if env_path is None:
+            env_path = self.run.root_path / "connito" / "validator" / "docker" / ".env"
+
+        wallet_path = Path.home() / ".bittensor" / "wallets"
+        data_dir = self.run.root_path
+
+        # Use hotkey name + run name as project name so multiple validators
+        # on the same host get unique container names automatically.
+        # e.g. connito-hk1-mainnet-server-1
+        project_name = f"connito-{self.chain.hotkey_name}-{self.run.run_name}"
+        expert_groups_path = self.run.root_path / "expert_groups"
+
+        lines = [
+            f"COMPOSE_PROJECT_NAME={project_name}",
+            f"IMAGE=ghcr.io/connito-ai/connito-validator:stable",
+            f"WALLET_NAME={self.chain.coldkey_name}",
+            f"HOTKEY_NAME={self.chain.hotkey_name}",
+            f"BITTENSOR_WALLET_PATH={wallet_path}",
+            f"DATA_DIR={data_dir}",
+            f"CONFIG_PATH={self.ckpt.checkpoint_path / 'config.yaml'}",
+            f"EXPERT_GROUPS_PATH={expert_groups_path}",
+            f"VALIDATOR_GPU_ID=0",
+            f"HF_TOKEN=",
+            f"WANDB_API_KEY=",
+            f"WANDB_MODE=online",
+            f"WATCHTOWER_POLL_INTERVAL=300",
+            f"WATCHTOWER_NOTIFICATIONS=",
+            f"WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL=",
+            f"",
+            f"# --- Central log aggregation (opt-in; see docs/validator-docker-operators.md) ---",
+            f"# Uncomment COMPOSE_FILE and fill the three values below to ship validator",
+            f"# stdout to Grafana Cloud Loki. Credentials are issued by the subnet owner.",
+            f"# COMPOSE_FILE=docker-compose.yml:docker-compose.loki.override.yml",
+            f"# LOKI_URL=",
+            f"# HOTKEY_SS58=",
+            f"# VALIDATOR_UID=",
+        ]
+
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logger.info("Wrote Docker compose .env", path=str(env_path))
+
+
+class OwnerConfig(WorkerConfig):
+    role: str = "owner"
+    ckpt: OwnerCheckpointCfg = Field(default_factory=OwnerCheckpointCfg)
+
+
+# ---------------------------
+# CLI
+# ---------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train mycelia with config")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # --- create_config ---
+    create_cfg = subparsers.add_parser("create_config", help="Generate a template config file")
+    create_cfg.add_argument("--role", choices=["miner", "validator"], required=True, help="Role to generate config for")
+    create_cfg.add_argument("--hotkey_name", type=str, help="Wallet hotkey name")
+    create_cfg.add_argument("--coldkey_name", type=str, help="Wallet coldkey name")
+    create_cfg.add_argument("--run_name", type=str, help="Run name")
+
+    # --- create_docker_env ---
+    create_env = subparsers.add_parser("create_docker_env", help="Generate Docker compose .env from an existing config")
+    create_env.add_argument("--path", type=str, required=True, help="Path to existing validator YAML config file")
+
+    # --- Top-level flags used by connito.validator.run (Docker entrypoint) ---
+    parser.add_argument("--path", type=str, help="Path to validator YAML config file")
+    parser.add_argument(
+        "--auto_update_config",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-reset locked config fields to defaults without prompting.",
+    )
+
+    parser.add_argument("--hotkey_name", type=str, help="Wallet hotkey name")
+    parser.add_argument("--coldkey_name", type=str, help="Wallet coldkey name")
+    parser.add_argument("--dht_port", type=int, default=7002, help="DHT port for owner DHT bootstrap service")
+    parser.add_argument("--dht_public_ip", type=str, help="Public IP address for DHT peer discovery")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite current config with on-disk one.")
+    parser.add_argument("--no_bump", action="store_true", help="Do not bump run_name on config diff.")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Test mode: wait_till() short-circuits without sleeping or polling the chain.",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    if args.command == "create_config":
+        config_dict: dict[str, Any] = {}
+        if args.run_name:
+            config_dict["run"] = {"run_name": args.run_name}
+        if args.hotkey_name:
+            config_dict.setdefault("chain", {})["hotkey_name"] = args.hotkey_name
+        if args.coldkey_name:
+            config_dict.setdefault("chain", {})["coldkey_name"] = args.coldkey_name
+
+        if args.role == "validator":
+            cfg = ValidatorConfig(**config_dict)
+            cfg.write()
+            cfg.write_docker_env()
+        elif args.role == "miner":
+            MinerConfig(**config_dict).write()
+
+    elif args.command == "create_docker_env":
+        # Tooling, not a node: no owner-API call, no task resolution.
+        cfg = ValidatorConfig.from_path(
+            args.path, active_task=None, auto_update_config=args.auto_update_config
+        )
+        cfg.write_docker_env()
+

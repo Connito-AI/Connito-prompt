@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "connito-prompt-validator"
+# The release tag is the version: see the README's "What you are reading".
+version = "0.0.0"
+description = "Connito subnet 102's prompt validator: how committed models are scored on task prompts."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+# The exact environment is requirements.lock (installed with --no-deps); these are its direct dependencies.
+dependencies = [
+  "bittensor==11.3.0",
+  "torch==2.10.0",
+  "transformers==5.18.0",
+  "huggingface_hub",
+  "pydantic>=2",
+  "python-dotenv",
+  "requests",
+  "safetensors",
+  "structlog",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["connito"]
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --disable-warnings"
+testpaths = ["connito/test"]
+pythonpath = ["."]  # the tests import connito from this checkout, not an installed copy
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"

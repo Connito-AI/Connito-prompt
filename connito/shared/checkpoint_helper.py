@@ -1,0 +1,511 @@
+import errno
+import os
+import shutil
+from pathlib import Path
+from typing import NamedTuple
+
+import fsspec
+import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
+from torchdata.stateful_dataloader import StatefulDataLoader
+
+from connito.shared.app_logging import structlog
+from connito.shared.helper import (
+    MINER_CHECKPOINT_SUFFIXES,
+    expert_group_shard_name,
+    load_state_dict_from_path,
+)
+
+logger = structlog.getLogger(__name__)
+
+
+class TensorSpec(NamedTuple):
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
+_SAFETENSORS_DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32}
+
+
+def cleanup_temporary_checkpoint_dirs(checkpoint_root: str | Path) -> list[str]:
+    checkpoint_root = Path(checkpoint_root)
+    if not checkpoint_root.exists():
+        return []
+
+    removed: list[str] = []
+    for path in checkpoint_root.iterdir():
+        if not path.name.startswith(".tmp_"):
+            continue
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+        removed.append(str(path))
+
+    if removed:
+        logger.warning("Removed stale temporary checkpoints", count=len(removed), paths=removed)
+
+    return removed
+
+
+# @total_ordering
+# @dataclass
+# class ModelCheckpoint:
+#     global_ver: int = 0
+#     inner_opt: int = 0
+#     path: Path | None = None
+#     role: str | None = None  # [miner, validator]
+#     model_hash: str | None = None
+
+#     def __eq__(self, other: object) -> bool:
+#         try:
+#             other_global_ver = other.global_ver  # type: ignore[attr-defined]
+#             other_inner_opt = other.inner_opt  # type: ignore[attr-defined]
+#             other_model_hash = getattr(other, "model_hash", None)
+#         except AttributeError:
+#             return NotImplemented
+#         return (
+#             self.global_ver == other_global_ver
+#             and self.inner_opt == other_inner_opt
+#             and self.model_hash == other_model_hash
+#         )
+
+#     def __lt__(self, other: "ModelCheckpoint") -> bool:
+#         try:
+#             other_global_ver = other.global_ver  # type: ignore[attr-defined]
+#             other_inner_opt = other.inner_opt  # type: ignore[attr-defined]
+#         except AttributeError:
+#             return NotImplemented
+
+#         # Compare by global_ver first
+#         if self.global_ver != other_global_ver:
+#             return self.global_ver < other_global_ver
+
+#         # Then compare by inner_opt
+#         return self.inner_opt < other_inner_opt
+
+
+# ====================
+# Checkpoint saving / loading
+# ====================
+def save_residual_shard(model: torch.nn.Module, dest_dir: str | Path, group_id: int) -> Path:
+    """Write the model's residual experts and routers, each in its own dtype, as the group's shard."""
+    path = Path(dest_dir) / expert_group_shard_name(group_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Parameters, not state_dict(): that would dequantize every fp8 expert to a CPU copy first.
+    residual = {n: p.detach().cpu().contiguous() for n, p in model.named_parameters() if ".residual_" in n}
+    save_file(residual, str(path))
+    return path
+
+
+def group_shard(path: str | Path, group_id: int | None) -> Path:
+    """`path` itself if it is a file (a submission), else the group's shard in that folder."""
+    path = Path(path)
+    return path if path.is_file() else path / expert_group_shard_name(group_id)
+
+
+def verify_residual_shard(path: str | Path, expected: dict[str, TensorSpec]) -> dict[str, torch.Tensor] | None:
+    """The shard's tensors if its header is exactly `expected` and every tensor is finite and trained; else None."""
+    path = Path(path)
+    try:
+        with safe_open(str(path), framework="pt") as f:
+            slices = {k: f.get_slice(k) for k in f.keys()}
+            header = {k: TensorSpec(tuple(t.get_shape()), _SAFETENSORS_DTYPES.get(t.get_dtype()))
+                      for k, t in slices.items()}
+            if path.suffix != ".safetensors" or header != expected:
+                logger.warning(
+                    "residual shard refused: off spec", path=str(path),
+                    missing=sorted(expected.keys() - header.keys())[:5],
+                    extra=sorted(header.keys() - expected.keys())[:5],
+                    mismatched=sorted(k for k in expected.keys() & header.keys() if header[k] != expected[k])[:5],
+                )
+                return None
+            # From the same open, so these are the tensors whose header passed.
+            state_dict = {k: f.get_tensor(k) for k in header}
+    except Exception as e:
+        logger.warning("residual shard refused: unreadable", path=str(path), error=str(e))
+        return None
+    non_finite = sorted(k for k, t in state_dict.items() if not torch.isfinite(t).all())
+
+    def zero(expert: str, proj: str) -> bool:
+        return not state_dict[f"{expert}.{proj}.weight"].any()
+
+    experts = {k.rsplit(".", 2)[0] for k in state_dict if ".residual_experts." in k}
+    # Honest training never leaves one: ResidualCfg keeps A/τ below 80, so q > 0 on every token and every
+    # down_proj moves at the first step.
+    untrained = sorted(e for e in experts if zero(e, "down_proj") or (zero(e, "gate_proj") and zero(e, "up_proj")))
+    if non_finite or untrained:
+        logger.warning("residual shard refused", path=str(path), non_finite=non_finite[:5], untrained=untrained[:5])
+        return None
+    return state_dict
+
+
+def save_checkpoint(
+    checkpoint_path: str | Path,
+    model: torch.nn.Module,
+    group_id: int,
+    rank: int,
+    scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
+    inner_optimizer: torch.optim.Optimizer | None = None,
+    outer_optimizer: torch.optim.Optimizer | None = None,
+    loss: float | None = None,
+    data_loader: StatefulDataLoader | None = None,
+    save_global_state: bool = True,
+) -> None:
+    """
+    Saves the current model checkpoint.
+
+    Returns:
+        None
+    """
+    checkpoint_path = Path(checkpoint_path)
+    tmp_checkpoint_path = checkpoint_path.with_name(f".tmp_{checkpoint_path.name}")
+
+    cleanup_temporary_checkpoint_dirs(checkpoint_path.parent)
+
+    if tmp_checkpoint_path.exists():
+        shutil.rmtree(tmp_checkpoint_path)
+    tmp_checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+    write_path = tmp_checkpoint_path
+
+    try:
+        save_residual_shard(model, write_path, group_id)
+
+        # === save optimizer ===
+        if inner_optimizer is not None:
+            opt_checkpoint = {
+                "optimizer_state_dict": inner_optimizer.state_dict(),
+            }
+
+            target = write_path / "inner_optimizer.pt"
+            if not target.exists():
+                with fsspec.open(str(target), "wb") as f:
+                    torch.save(opt_checkpoint, f)
+
+        if outer_optimizer is not None:
+            opt_checkpoint = {
+                "optimizer_state_dict": outer_optimizer.state_dict(),
+            }
+            target = write_path / "outer_optimizer.pt"
+            if not target.exists():
+                with fsspec.open(str(target), "wb") as f:
+                    torch.save(opt_checkpoint, f)
+
+        # === save dataloader ===
+        if data_loader is not None:
+            rank_state_dict = {}
+            rank_state_dict["data_loader"] = data_loader.state_dict()
+
+            target = write_path / f"dataloader_rank{rank}.pt"
+            if not target.exists():
+                with fsspec.open(str(target), "wb") as f:
+                    torch.save(rank_state_dict, f)
+
+            del rank_state_dict
+
+        if save_global_state:
+            # === save global state ===
+            global_state_dict = {
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "loss": loss if loss is not None else 0,
+            }
+
+            target = write_path / "global_state.pt"
+            if not target.exists():
+                with fsspec.open(str(target), "wb") as f:
+                    torch.save(global_state_dict, f)
+
+        try:
+            os.replace(write_path, checkpoint_path)
+        except OSError as e:
+            if checkpoint_path.exists() and e.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                shutil.rmtree(checkpoint_path)
+                os.replace(write_path, checkpoint_path)
+            else:
+                raise
+    except Exception:
+        shutil.rmtree(write_path, ignore_errors=True)
+        raise
+
+    logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+
+def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int | str] | None = None):
+    def _matches_expert_group(file_path: str | Path, groups) -> bool:
+        if groups is None:
+            # No filter: still skip any legacy `model_shared.*` file so that
+            # backbone state from old globalver_* directories is never loaded
+            # — the backbone is reproduced deterministically from
+            # the model family's pinned checkpoint at instantiation time.
+            filename = Path(file_path).name
+            return filename not in ("model_shared.safetensors", "model_shared.pt")
+
+        if isinstance(groups, (list, tuple, set)):
+            return any(_matches_expert_group(file_path, g) for g in groups)
+
+        filename = Path(file_path).name
+        # Accept both `.safetensors` (new default) and `.pt` (legacy) so a
+        # miner upgrading mid-cycle can still resume from a `.pt` shard
+        # saved by the previous version.
+        return filename in (
+            f"model_expgroup_{groups}.safetensors",
+            f"model_expgroup_{groups}.pt",
+        )
+
+    full_state_dict = {}
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.is_file() and checkpoint_path.suffix in MINER_CHECKPOINT_SUFFIXES:
+        # Miner submission — could be `.safetensors` (preferred) or `.pt`.
+        # `load_state_dict_from_path` dispatches by suffix and gates `.pt`
+        # with `weights_only=True` so a malicious miner cannot execute code
+        # via a crafted `__reduce__` payload.
+        full_state_dict = load_state_dict_from_path(checkpoint_path)
+        logger.debug("loaded checkpoint file", path=checkpoint_path)
+
+    else:
+        model_files = get_model_files(checkpoint_path)
+
+        for f in model_files:
+            if expert_groups is not None and not _matches_expert_group(f.path, expert_groups):
+                logger.debug("skipping checkpoint file", path=f, expert_groups=expert_groups)
+                continue
+
+            # Dispatch on suffix: `.safetensors` shards are flat tensor dicts
+            # (no `{"model_state_dict": ...}` wrapper, no `loss` key); `.pt`
+            # shards retain the legacy wrapped format saved by older miner
+            # versions. `load_state_dict_from_path` already handles both for
+            # the single-file branch above; here we replicate the suffix
+            # logic inline because we need to keep the open-file handle from
+            # `fsspec.open_files`.
+            suffix = Path(f.path).suffix.lower()
+            if suffix == ".safetensors":
+                from safetensors.torch import load_file
+                shard_sd = load_file(str(f.path), device="cpu")
+                full_state_dict.update(shard_sd)
+                logger.debug("loaded checkpoint file", path=f, format="safetensors")
+            else:
+                with f as fh:
+                    state_dict = torch.load(
+                        fh, map_location=torch.device("cpu"), weights_only=True,
+                    )
+                    full_state_dict.update(state_dict["model_state_dict"])
+                    loss = state_dict["loss"] if "loss" in state_dict else -1
+                    del state_dict
+                    logger.debug("loaded checkpoint file", path=f, loss=round(loss, 5))
+
+    return full_state_dict
+
+
+# ====================
+# Checkpoint selection
+# ====================
+
+# def start_model_from(
+#     rank: int, config: MinerConfig, primary_ckpt_path: Path, secondary_ckpt_path: Path | None
+# ) -> tuple[bool, ModelCheckpoint, str | Path | None]:
+#     # if it is a validator, then just start from its own checkpoint
+#     if secondary_ckpt_path is None:
+#         logger.info("returning primary checkpoint")
+#         return get_resume_info(rank, config, config.ckpt.checkpoint_path)
+
+#     primary_ckpt_found, primary_model_meta, latest_primary_ckpt = get_resume_info(rank, config, primary_ckpt_path)
+#     secondary_ckpt_found, secondary_model_meta, latest_secondary_ckpt = get_resume_info(
+#         rank, config, secondary_ckpt_path
+#     )
+
+#     # --- handling either miner / validator checkpoint not found ---
+#     if not secondary_ckpt_found:
+#         logger.info(
+#             "secondary checkpoint not found, using primary",
+#             primary_ckpt_path=primary_ckpt_path,
+#             secondary_ckpt_path=secondary_ckpt_path,
+#             model_meta=primary_model_meta,
+#         )
+#         return primary_ckpt_found, primary_model_meta, latest_primary_ckpt
+
+#     if not primary_ckpt_found and latest_secondary_ckpt is not None:
+#         logger.info(
+#             "primary checkpoint not found, using secondary",
+#             primary_ckpt_path=primary_ckpt_path,
+#             secondary_ckpt_path=secondary_ckpt_path,
+#             model_meta=secondary_model_meta,
+#         )
+#         return secondary_ckpt_found, secondary_model_meta, latest_secondary_ckpt
+
+#     # --- Return based on more updated version ---
+#     if secondary_model_meta >= primary_model_meta and latest_secondary_ckpt is not None:
+#         logger.info("Largest local model", secondary_model_meta)
+#         return secondary_ckpt_found, secondary_model_meta, latest_secondary_ckpt
+#     else:
+#         logger.info("Largest local model", primary_model_meta)
+#         return primary_ckpt_found, primary_model_meta, latest_primary_ckpt
+
+
+# def get_resume_info(
+#     rank: int, config: MinerConfig | ValidatorConfig, path: Path | None = None, msg: str = ""
+# ) -> tuple[bool, ModelCheckpoint, Path | None]:
+#     """
+#     Retrieves the resume information for a given rank and checkpoint configuration.
+
+#     Args:
+#         rank (int): The rank of the process.
+#         ckpt_config (Config): The configuration object for the checkpoint.
+
+#     Returns:
+#         tuple[bool, int, str | None]: A tuple containing a boolean indicating success,
+#         the checkpoint step, and an optional string message.
+#     """
+#     """
+#     Check if we should resume from a checkpoint, if yes return the path to the checkpoint, otherwise return None
+#     """
+#     if config.ckpt.resume_from_ckpt is None:
+#         return False, ModelCheckpoint(), None
+
+#     elif isinstance(config.ckpt.resume_from_ckpt, bool):
+#         # Using fsspec to list directory contents
+#         try:
+#             if path is None:
+#                 path = config.ckpt.checkpoint_path
+
+#             ckpt_files = get_sorted_checkpoints(path)
+
+#         except FileNotFoundError:
+#             logger.debug(
+#                 f"Get resume info from folder {msg}", result="folder not found", path={config.ckpt.checkpoint_path}
+#             )
+#             return False, ModelCheckpoint(), None
+
+#         if len(ckpt_files) == 0:
+#             logger.debug(
+#                 f"Get resume info from folder {msg}", result="doesnt exist any file", path={config.ckpt.checkpoint_path}
+#             )
+#             return False, ModelCheckpoint(), None
+
+#         latest_ckpt = ckpt_files[0].path
+#         model_meta = ckpt_files[0]
+#         logger.debug(
+#             "Get resume info from folder",
+#             result="found",
+#             path={config.ckpt.checkpoint_path},
+#             model_meta=model_meta,
+#         )
+#         return True, model_meta, latest_ckpt
+
+# def get_sorted_checkpoints(checkpoint_path: str) -> dict[ModelCheckpoint]:
+#     fs, root = fsspec.core.url_to_fs(checkpoint_path)
+
+#     ckpt_files = []
+#     for f in fs.ls(root, detail=False):
+#         if Path(f).name.startswith(".tmp_"):
+#             continue
+
+#         if "yaml" in f.lower():  # safer, catches .YAML/.Yaml/.yml too
+#             continue
+
+#         meta = parse_dynamic_filename(f)
+#         if meta is None:
+#             continue
+
+#         # ensure both fields exist and are numeric
+#         model_meta = ModelCheckpoint(
+#             global_ver=int(meta.get("globalver", 0)), inner_opt=int(meta.get("inneropt", 0)), path=Path(f)
+#         )
+#         ckpt_files.append(model_meta)
+
+#     # sort descending by globalver, then inneropt
+#     return sorted(
+#         ckpt_files,
+#         key=lambda item: (-item.global_ver, -item.inner_opt),
+#     )
+
+
+def get_model_files(checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)  # normalize to Path object
+
+    # Case 1: checkpoint_path IS a single checkpoint file (.safetensors preferred, .pt legacy).
+    if checkpoint_path.is_file() and checkpoint_path.suffix in MINER_CHECKPOINT_SUFFIXES:
+        return fsspec.open_files(str(checkpoint_path), mode="rb")
+
+    # Case 2: checkpoint_path is a directory → match model*.{safetensors,pt}
+    # inside it. The list is concatenated so callers see a single iterable
+    # (preserves the existing API contract). `.safetensors` listed first so
+    # if both exist for the same shard the new format wins on dispatch order.
+    files = []
+    for suffix in MINER_CHECKPOINT_SUFFIXES:
+        pattern = str(checkpoint_path / f"model*{suffix}")
+        files.extend(fsspec.open_files(pattern, mode="rb"))
+    return files
+
+
+# def delete_old_checkpoints(checkpoint_path: str, topk: int) -> list[str]:
+#     """
+#     Deletes old checkpoints, keeping only the top 'k' most recent ones.
+
+#     Args:
+#         checkpoint_path (str): The path to the checkpoint directory.
+#         topk (int): The number of recent checkpoints to keep.
+
+#     Returns:
+#         list[str]: A list of deleted checkpoint filenames.
+#     """
+#     fs = GenericFileSystem()
+#     sorted_ckpt_files = get_sorted_checkpoints(checkpoint_path)
+
+#     ckpt_deleted = []
+#     for model_meta in sorted_ckpt_files[topk:]:
+#         fs.rm(str(model_meta.path), recursive=True)
+#         ckpt_deleted.append(str(model_meta.path))
+#     return ckpt_deleted
+
+
+# def delete_old_checkpoints_by_hotkey(folder_path: Path):
+#     """
+#     Deletes all non-latest submission files coming from the same hotkey.
+#     Keeps only the file with the highest block number per hotkey.
+
+#     Requires: parse_dynamic_filename(filename: str) -> dict
+#     """
+#     if not folder_path.exists():
+#         raise FileNotFoundError(f"Folder not found: {folder_path.resolve()}")
+
+#     # Step 1: Group files by hotkey
+#     submissions_by_hotkey = {}
+#     for file_path in folder_path.glob("*.pt"):
+#         meta = parse_dynamic_filename(file_path.name)
+#         if "hotkey" not in meta or "block" not in meta:
+#             print(f"⚠️ Skipping malformed filename: {file_path.name}")
+#             continue
+
+#         hotkey = meta["hotkey"]
+#         block = meta["block"]
+
+#         # Track the latest submission per hotkey
+#         if hotkey not in submissions_by_hotkey:
+#             submissions_by_hotkey[hotkey] = []
+#         submissions_by_hotkey[hotkey].append((block, file_path))
+
+#     # Step 2: For each hotkey, keep only the highest block file
+#     deleted_files = []
+#     for _, entries in submissions_by_hotkey.items():
+#         # Sort by block number descending (latest first)
+#         entries.sort(key=lambda x: x[0], reverse=True)
+
+#         # Keep the first (latest) one, delete the rest
+#         for _, file_path in entries[2:]:
+#             try:
+#                 os.remove(file_path)
+#                 deleted_files.append(file_path.name)
+#             except Exception as e:
+#                 print(f"❌ Failed to delete {file_path.name}: {e}")
+
+#     # Step 3: Log result
+#     if deleted_files:
+#         logger.info(f"🧹 Deleted {len(deleted_files)} outdated submission(s):", deleted_files)
+#         for f in deleted_files:
+#             print(f"   - {f}")
+#     else:
+#         logger.info("✅ No outdated submissions found.")
+
+#     return deleted_files

@@ -1,0 +1,60 @@
+# The prompt validator's config, with the dataless-api as the prompt source. Copy it out of the checkout and fill in
+# the wallet names:
+#
+#   mkdir -p ~/Connito/config/prompt-validator
+#   cp connito/prompt_validator/config.example.yaml ~/Connito/config/prompt-validator/config.yaml
+#   PV_ALLOWED_GPUS=<gpu> CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<gpu> \
+#     python -m connito.prompt_validator.run --path ~/Connito/config/prompt-validator/config.yaml [--test]
+#
+# The run needs exactly one GPU, by nvidia-smi's index, one of those PV_ALLOWED_GPUS names: on a host whose GPUs
+# are shared, the ones this process may take.
+# Secrets go in a .env next to this file (or --env-file): JEV_DIRECT_API_KEY, HF_TOKEN, and for an encrypted hotkey
+# its BT_PW_* variable, which holds bittensor's encoded password (save_password_to_environment), not the password.
+# This prints that line for the .env, asking for the password without echoing it (its name may hold a "-", which a
+# shell export cannot set, so it goes in the .env). The name comes from the hotkey file's full path, so pass the
+# wallet_path below, or ~/.bittensor/wallets if unset, and make it again if the wallet moves:
+#
+#   python -c "import ctypes, getpass, bittensor as bt; from bittensor.sp_core import save_password_to_environment as save; k = bt.Wallet(name='<your_coldkey>', hotkey='<your_hotkey>', path='<wallet_path>').hotkey_file; v = save(k.env_var_name(), getpass.getpass('hotkey password: ')); g = ctypes.CDLL(None).getenv; g.restype = ctypes.c_char_p; print(f'{v}={g(v.encode()).decode()}')"
+#
+# A variable already set wins. HF_* other than HF_TOKEN, and CUDA_*, are read on import, so set them in the
+# process environment: in the .env they are ignored, with a warning. HF_TOKEN is read at each download, so the
+# .env's is used (the fetch's download child inherits it); no log line prints a .env value. --test runs a
+# dataless-api test cycle, like test_mode below. --loop runs every cycle in turn. With --loop, --max-cycles N exits 0
+# once this process has seen N cycles published (by it, or found published already when it reported them).
+#
+# It is a validator config: every section not written here takes its defaults (connito/shared/config.py), and
+# every prompt_validator setting not written here takes its default in connito/prompt_validator/config.py.
+chain:
+  coldkey_name: <your_coldkey>      # the wallet under wallet_path
+  hotkey_name: <your_hotkey>        # signs every dataless-api request; must be on cycle-api's validator whitelist
+  # wallet_path: /path/to/wallets   # directory holding the wallet; empty = ~/.bittensor/wallets
+
+prompt_validator:
+  prompt_source: dataless           # the owner's internal prompts from the dataless-api
+  runs_dir: /scratch/connito/prompt-validator/runs   # every stage's output; a relative path hangs off run.root_path
+  # write_root: /scratch            # runs_dir must resolve under it; a published cycle's shards are deleted
+  # So must HF_HOME, HF_HUB_CACHE, HF_XET_CACHE, TRITON_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR, XDG_CACHE_HOME,
+  # CUDA_CACHE_PATH and TMPDIR (each set in the process environment, or its default), or the run stops at start;
+  # with engine vllm, VLLM_CACHE_ROOT and VLLM_CONFIG_ROOT too (the worker gets this environment, secrets dropped).
+  # One runs_dir per validator hotkey and dataless-api: its published.jsonl names published cycles by id alone.
+  # Keep runs_dir on a local disk: its locks (flock) and ledger appends (O_APPEND) aren't reliable on NFS.
+  # --loop publishes each cycle to the dataless-api after reward; a publish is final.
+  # catch_up_min_hours: 6.0         # --loop runs a missed cycle only with this long left to start its report
+  # model_selection: top            # top: the max_models below; all: every in-group miner commit, no cap
+  # max_models: 100                 # distinct models scored per cycle, by incentive (0 too); in rules_sha256
+  # engine: vllm                    # default hf; see scripts/prompt_validator_vllm/README.md
+  # vllm:
+  #   python: /path/to/venv-vllm/bin/python
+  #   checkpoint: /path/to/qwen3.6-a3b-fp8row-995ad96
+  dataless:
+    url: https://dataless-api.connito.ai
+    # test_mode: true               # the dataless-api's /v1/test cycles, opened and closed by the owner
+  jev:
+    spend_cap_usd: 5.0              # per scoring cycle; scoring also needs JEV_DIRECT_API_KEY in the environment
+    resolved: jev-1.14.0            # the Jev version asked for by name; a response from another version stops the loop
+    # price_per_m: <USD>            # required to score: your price per million input tokens, for the spend cap
+  set_weights: false                # must stay false: the prompt validator sets no chain weights in this phase
+  # weights:                        # a dry run after report: runs/<cycle>/weights/weights.jsonl; it never sets weights
+  #                                 # --loop --test cycles are measured too, against the real chain's row
+  #   mode: dry_run                 # default off; on is refused
+  #   prompt_share: 0.2             # the prompt validator's part of the miners' portion, after the owner's share

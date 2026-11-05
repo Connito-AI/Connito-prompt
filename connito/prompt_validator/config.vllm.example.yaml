@@ -1,0 +1,54 @@
+# The prompt validator's config with the vLLM answers engine and 2,048-token answers: config.example.yaml's settings,
+# plus engine: vllm. Read config.example.yaml first: wallet, .env secrets and the BT_PW_* line are the same here.
+#
+# Point the paths below at your vLLM venv and your export_fp8row.py checkpoint.
+# The vLLM venv needs this checkout's connito_vllm, from the same commit as the stage code (the venv has no pip):
+#
+#   uv pip install --python <vllm.python> -e scripts/prompt_validator_vllm
+#
+# Pin the process to one GPU that PV_ALLOWED_GPUS allows, in the process environment; the vLLM worker inherits it
+# unchanged:
+#
+#   PV_ALLOWED_GPUS=<gpu> CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<gpu> HF_HOME=<write_root>/hf \
+#     python -m connito.prompt_validator.run --path <this file> --loop
+#
+# Every cache config.example.yaml lists must be under write_root, and with engine vllm so must
+# VLLM_CACHE_ROOT and VLLM_CONFIG_ROOT (unset: under XDG_CACHE_HOME and XDG_CONFIG_HOME, else ~/.cache and ~/.config).
+#
+# The GPU must be free: vLLM takes gpu_memory_utilization of its whole memory at start.
+# engine, max_new_tokens and the vllm fields marked below are in rules_sha256: change them only between cycles, before
+# the next cycle's snapshot stage runs. A cycle snapshotted under other values fails check_rules until
+# --stage snapshot is rerun.
+chain:
+  network: wss://archive.chain.opentensor.ai:443
+  coldkey_name: <your_coldkey>
+  hotkey_name: <your_hotkey>
+  wallet_path: /path/to/wallets     # absolute; the hotkey's BT_PW_* name is spelled from it
+
+cycle:                              # checked against cycle-api at start: a mismatch stops the run
+  train_period: 340
+  commit_period: 11
+  submission_period: 60
+
+prompt_validator:
+  prompt_source: dataless
+  runs_dir: /scratch/path/to/runs   # local disk under write_root; one per validator hotkey and dataless-api
+  max_new_tokens: 2048              # rules hash
+  engine: vllm                      # rules hash
+  vllm:
+    python: /path/to/venv-vllm/bin/python
+    checkpoint: /path/to/qwen3.6-a3b-fp8row-995ad96   # export_fp8row.py's output; its manifest.json: rules hash
+    version: "0.32.0"               # rules hash
+    max_num_seqs: 128               # rules hash
+    enforce_eager: false            # rules hash
+    gpu_memory_utilization: 0.9
+    # About 60 s per model for 20 prompts at 2,048 tokens; the stall window restarts at every finished request.
+    start_timeout_min: 20
+    stall_timeout_min: 10
+  dataless:
+    url: https://dataless-api.connito.ai
+  jev:
+    spend_cap_usd: 5.0
+  set_weights: false                # must stay false
+  # weights:                        # read-only dry run of a prompt:training split; see config.example.yaml
+  #   mode: dry_run
