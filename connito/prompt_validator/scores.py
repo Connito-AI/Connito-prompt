@@ -30,8 +30,10 @@ def run_scores(config, scoring_cycle_id: int) -> list[dict]:
     if not answers_path.exists():
         raise RuntimeError(f"no answers to score: {answers_path} is missing")
     answers = read_rows(answers_path)
+    # Each answer on its own prompt's task's levels: a cycle can hold prompts of two tasks (jev.CRITERIA_BY_TASK).
     results = cycle_client(pv, scoring_cycle_id).score_many(
-        [(prompts[a["prompt_id"]]["request"], prompts[a["prompt_id"]]["prompt"], a["text"]) for a in answers]
+        [(prompts[a["prompt_id"]]["request"], prompts[a["prompt_id"]]["prompt"], a["text"]) for a in answers],
+        tasks=[prompts[a["prompt_id"]].get("customer_task_id") for a in answers],
     )
     # Without `cached`, so the rows depend only on the answers and the Jev pin, not on what a rerun found cached.
     rows = [a | r for a, r in zip(answers, results, strict=True)]

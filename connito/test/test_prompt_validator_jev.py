@@ -8,7 +8,7 @@ import requests
 
 from connito.prompt_validator import jev
 from connito.prompt_validator.config import JevCfg
-from connito.prompt_validator.stage_io import read_rows, write_rows
+from connito.prompt_validator.stage_io import read_rows, stage_path, write_rows
 from connito.shared import helper
 
 REQUEST = {"goal": "goal one", "examples": ["example one"], "tone": "plain"}
@@ -362,3 +362,99 @@ def test_without_a_price_no_client_is_made_and_nothing_is_called(tmp_path, monke
     monkeypatch.setattr(jev, "get_with_retry", lambda *a, **k: pytest.fail("Jev was called"))
     with pytest.raises(RuntimeError, match="jev.price_per_m is not set: the spend cap needs Jev's price"):
         jev.JevClient(JevCfg(), tmp_path / "jev_cache", tmp_path / "jev_calls.jsonl")
+
+
+# --- levels by the prompt's task ---
+
+LESSON = "exp_lesson_residual"
+
+
+def _criteria(body):
+    return [q["criteria"] for q in body["questions"].values()]
+
+
+def test_a_lesson_prompt_is_scored_on_the_lesson_levels(serve, client):
+    fake = serve()
+    result = client().score_many([(None, "Teach it", "4")], tasks=[LESSON])[0]
+
+    [body] = fake.bodies
+    assert _criteria(body) == [jev.LESSON_SCORE_LEVELS]
+    # Only the levels change: the question and its score-0 rule are the generic ones.
+    assert [q["instructions"]["question"] for q in body["questions"].values()] == [jev.QUALITY_QUESTION_NO_REQUEST]
+    assert "aimed at the grader" in jev.LESSON_SCORE_LEVELS[0]
+    assert result["score"] == 0.8
+
+
+@pytest.mark.parametrize("task", ["exp_pmc_residual", None, "", "a_task_not_mapped"])
+def test_any_other_task_or_none_is_scored_on_the_generic_levels(serve, client, task):
+    fake = serve()
+    client().score_many([(None, "Explain it", "4"), (REQUEST, "Explain it", "4")], tasks=[task, task])
+
+    assert sorted(map(str, (c for body in fake.bodies for c in _criteria(body)))) == sorted(
+        map(str, [jev.SCORE_LEVELS_NO_REQUEST, jev.SCORE_LEVELS]))
+
+
+def test_without_tasks_every_item_gets_the_generic_levels_and_its_old_cache_key(serve, client, tmp_path):
+    fake = serve()
+    c = client()
+    c.score_many([(None, "Explain it", "4")])
+    # The generic levels' cache key did not change with CRITERIA_BY_TASK: a score cached before it is reused.
+    assert c.score_many([(None, "Explain it", "4")], tasks=["exp_pmc_residual"])[0]["cached"] is True
+    assert c.score_many([(None, "Explain it", "4")], tasks=[None])[0]["cached"] is True
+    assert len(fake.bodies) == 1
+
+
+def test_a_mixed_batch_picks_the_levels_per_prompt(serve, client):
+    fake = serve()
+    items = [(None, "Teach it", "4"), (None, "Explain it", "3"), (None, "Teach it", "2"), (None, "Explain it", "5")]
+    results = client().score_many(items, tasks=[LESSON, "exp_pmc_residual", LESSON, None])
+
+    by_prompt = {body["state"]["prompt"]: body for body in fake.bodies}
+    assert set(by_prompt) == {"Teach it", "Explain it"} and len(fake.bodies) == 2
+    assert _criteria(by_prompt["Teach it"]) == [jev.LESSON_SCORE_LEVELS] * 2
+    assert _criteria(by_prompt["Explain it"]) == [jev.SCORE_LEVELS_NO_REQUEST] * 2
+    assert [r["score"] for r in results] == [0.8, 0.6, 0.4, 1.0]
+
+
+def test_one_prompt_text_under_two_tasks_is_scored_twice_on_each_tasks_levels(serve, client):
+    fake = serve()
+    results = client().score_many([(None, "Same text", "4")] * 2, tasks=[LESSON, "exp_pmc_residual"])
+
+    assert sorted(map(str, (c for body in fake.bodies for c in _criteria(body)))) == sorted(
+        map(str, [jev.LESSON_SCORE_LEVELS, jev.SCORE_LEVELS_NO_REQUEST]))
+    assert [r["cached"] for r in results] == [False, False]
+
+
+def test_every_task_s_levels_are_on_the_generic_scale():
+    for levels in jev.CRITERIA_BY_TASK.values():
+        assert len(levels) == jev.MAX_LEVEL + 1
+        assert [level.split(" ", 1)[0] for level in levels] == [str(n) for n in range(jev.MAX_LEVEL + 1)]
+
+
+def test_the_scores_stage_passes_each_prompt_s_own_task(monkeypatch, tmp_path):
+    from connito.prompt_validator import scores
+
+    snapshot_dir = stage_path(tmp_path, 7, "snapshot").parent
+    write_rows(snapshot_dir / "prompts.jsonl", [
+        {"prompt_id": "1", "prompt": "Teach it", "request": None, "customer_task_id": LESSON},
+        {"prompt_id": "2", "prompt": "Explain it", "request": None, "customer_task_id": "exp_pmc_residual"},
+        {"prompt_id": "3", "prompt": "Old row", "request": None},
+    ])
+    write_rows(stage_path(tmp_path, 7, "answers"), [
+        {"uid": u, "hotkey": f"hk{u}", "model_hash": f"m{u}", "prompt_id": p, "text": "4"}
+        for u in (1, 2) for p in ("1", "2", "3")
+    ])
+    seen = {}
+
+    class Client:
+        def score_many(self, items, tasks=None):
+            seen["tasks"] = tasks
+            return [{"score": 0.8, "expected_score": 0.8, "jev_call_id": "c"} for _ in items]
+
+    monkeypatch.setattr(scores, "snapshot_meta", lambda config, cycle: {})
+    monkeypatch.setattr(scores, "selected_prompts", lambda pv, cycle: [])
+    monkeypatch.setattr(scores, "cycle_client", lambda pv, cycle: Client())
+    config = SimpleNamespace(prompt_validator=SimpleNamespace(runs_dir=tmp_path))
+
+    assert len(scores.run_scores(config, 7)) == 6
+    assert seen["tasks"] == [LESSON, "exp_pmc_residual", None] * 2

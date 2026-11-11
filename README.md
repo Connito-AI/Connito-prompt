@@ -23,8 +23,8 @@ behaviour. The guide for miners is at <https://doc.connito.ai/miner/prompt-evalu
   `rules_sha256` this release computes for production's settings, and the cycles production scores carry the same
   hash.
 - **Scoring rules have a fingerprint.** Everything that decides a grade is hashed into `rules_sha256`: the base
-  model, how answers are generated, which models are scored, the copy and reward rules, and Jev's version and
-  questions. A cycle snapshotted under other rules cannot be scored. The tests pin the hash this release computes
+  model, how answers are generated, which models are scored, the copy and reward rules, and Jev's version,
+  questions and levels by task (`CRITERIA_BY_TASK`). A cycle snapshotted under other rules cannot be scored. The tests pin the hash this release computes
   for the production settings (`connito/test/test_prompt_validator_loss_rank.py`). If a cycle was scored under a
   hash this release can't produce, that cycle used newer rules.
 - **Read-only mirror.** Pull requests here can't be merged: the next release would overwrite them. Please open an
@@ -55,8 +55,13 @@ models evaluated are the ones committed on chain at that block (`cutoff.py`).
    engine, and its README describes how it was checked against the Hugging Face path.
 5. **Grading.** Each answer is graded by **Jev**, TypeSafe's grading API, at a version pinned by name (`jev.py`).
    Jev is given the prompt, and rates the answer on six levels from 0 to 5:
-   - the prompts production scores come with no customer request, so the question and the six level descriptions
-     sent are `QUALITY_QUESTION_NO_REQUEST` and `SCORE_LEVELS_NO_REQUEST` in `jev.py`, word for word;
+   - the prompts production scores come with no customer request, so the question sent is
+     `QUALITY_QUESTION_NO_REQUEST` in `jev.py`, word for word;
+   - the six level descriptions depend on the prompt's own task (its `customer_task_id`), because one cycle can hold
+     prompts of more than one task. `CRITERIA_BY_TASK` in `jev.py` maps a task to its levels:
+     `exp_lesson_residual` prompts are graded on `LESSON_SCORE_LEVELS`. A task not in the map keeps the generic
+     levels, `SCORE_LEVELS_NO_REQUEST` (`SCORE_LEVELS` for a prompt with a customer request). Only the levels change
+     by task; the question, and its rule below, are the same;
    - `QUALITY_QUESTION` and `SCORE_LEVELS` are the same rubric for a prompt that has a customer request (its goal,
      examples and tone), which Jev is then given too. Production doesn't use them today;
    - any text in an answer aimed at the grader, such as a note on its own quality or how to score it, makes the
@@ -103,8 +108,8 @@ models evaluated are the ones committed on chain at that block (`cutoff.py`).
 This release is for reading the code and running its tests. A full cycle can't be run outside the subnet's
 validators: it signs every request to the prompt API with a validator hotkey on the subnet's whitelist.
 
-A tool to answer and grade your own prompts with your own model, on your own GPU and Jev key, is planned for
-v0.2.
+A tool to answer and grade your own prompts with your own model, on your own GPU and Jev key, is planned for a
+later release.
 
 ### Tests
 
@@ -142,7 +147,7 @@ The vLLM engine itself runs in a separate environment, `requirements-vllm.lock` 
 | `connito/prompt_validator/snapshot.py` | The cycle's prompts and models at the cutoff, and `rules_sha256` |
 | `connito/prompt_validator/fetch.py` | Downloading and checking each model's shard |
 | `connito/prompt_validator/answers.py` | Answering every prompt with each model |
-| `connito/prompt_validator/jev.py` | Jev's question and levels, and the grading calls |
+| `connito/prompt_validator/jev.py` | Jev's question, its levels by task, and the grading calls |
 | `connito/prompt_validator/scores.py` | One grade per answer |
 | `connito/prompt_validator/reward.py` | Means, copies, ranking and shares |
 | `connito/prompt_validator/report.py`, `dataless.py` | Publishing results to the prompt API |
