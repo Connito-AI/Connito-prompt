@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -172,3 +173,61 @@ def test_with_the_switch_on_a_selected_miner_prompt_is_scored_on_the_prompt_alon
         (2, pytest.approx(0.6))]
     # No customer request, as the pool's dataless prompts have none.
     assert [b["state"] for b in fake.bodies if b["state"]["prompt"] == "Miner one"] == [{"prompt": "Miner one"}]
+
+
+def test_a_lesson_answer_that_fails_its_format_check_scores_0_and_is_never_sent(config, fake, monkeypatch):
+    pv = config.prompt_validator
+    snapshot_dir = stage_path(pv.runs_dir, CYCLE_ID, "snapshot").parent
+    # p1 becomes a lesson task's prompt; p2 stays a prompt of a task with no format check.
+    write_rows(snapshot_dir / "prompts.jsonl", [
+        {**p, "customer_task_id": "exp_lesson_residual"} if p["prompt_id"] == "p1" else p
+        for p in read_rows(snapshot_dir / "prompts.jsonl")
+    ])
+    lesson = {"lesson_number": 1, "title": "t", "body": "b", "source_ids": []}  # p1 has no sources: none cited
+    course = json.dumps({"lessons": [lesson] * 3}) + "}"  # a stray brace: it passes
+    answers_path = stage_path(pv.runs_dir, CYCLE_ID, "answers")
+    write_rows(answers_path, [{**a, "text": course} if (a["model_hash"], a["prompt_id"]) == ("h1", "p1") else a
+                              for a in read_rows(answers_path)])  # h2's answer to p1 stays "2": no course
+    sent = []
+
+    def post(url, json=None, **kwargs):  # the fake scores an answer "n" as n: the course as 3
+        sent.extend(q["instructions"]["answer"] for q in json["questions"].values())
+        for q in json["questions"].values():
+            q["instructions"]["answer"] = "3" if q["instructions"]["answer"] == course else q["instructions"]["answer"]
+        return fake.post(url, json=json, **kwargs)
+
+    monkeypatch.setattr(requests, "post", post)
+    run.run_stages(config, CYCLE_ID, "scores")
+
+    assert sorted(sent) == sorted([course, "", "5"])  # "2" never reached Jev; p2's answers are not checked
+    rows = {(r["uid"], r["prompt_id"]): r for r in _scores(config)}
+    assert (rows[(2, "p1")]["score"], rows[(2, "p1")]["expected_score"], rows[(2, "p1")]["jev_call_id"]) == (
+        0.0, 0.0, None)
+    assert rows[(2, "p1")]["rank"] == 1 and rows[(1, "p1")]["rank"] == rows[(3, "p1")]["rank"] == 0
+    assert rows[(1, "p1")]["expected_score"] == pytest.approx(0.6) and rows[(1, "p1")]["jev_call_id"]
+    assert rows[(2, "p2")]["expected_score"] == pytest.approx(1.0)
+
+    first = _scores(config)
+    run.run_stages(config, CYCLE_ID, "scores")
+    assert _scores(config) == first  # a rerun writes the same rows
+
+
+def test_a_deeply_nested_lesson_answer_scores_0_and_the_stage_completes(config, fake):
+    pv = config.prompt_validator
+    snapshot_dir = stage_path(pv.runs_dir, CYCLE_ID, "snapshot").parent
+    write_rows(snapshot_dir / "prompts.jsonl", [
+        {**p, "customer_task_id": "exp_lesson_residual"} if p["prompt_id"] == "p1" else p
+        for p in read_rows(snapshot_dir / "prompts.jsonl")
+    ])
+    deep = '{"lessons": ' + "[" * 100_000 + "]" * 100_000 + "}"  # deep enough that the JSON decoder raises
+    answers_path = stage_path(pv.runs_dir, CYCLE_ID, "answers")
+    write_rows(answers_path, [{**a, "text": deep} if (a["model_hash"], a["prompt_id"]) == ("h2", "p1") else a
+                              for a in read_rows(answers_path)])
+
+    run.run_stages(config, CYCLE_ID, "scores")
+
+    rows = {(r["uid"], r["prompt_id"]): r for r in _scores(config)}
+    assert len(rows) == len(HASHES) * len(PROMPTS)
+    assert (rows[(2, "p1")]["expected_score"], rows[(2, "p1")]["jev_call_id"]) == (0.0, None)
+    assert deep not in [q["instructions"]["answer"] for b in fake.bodies for q in b["questions"].values()]
+    assert rows[(2, "p2")]["expected_score"] == pytest.approx(1.0)

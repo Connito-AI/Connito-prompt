@@ -441,7 +441,10 @@ def test_the_scores_stage_passes_each_prompt_s_own_task(monkeypatch, tmp_path):
         {"prompt_id": "3", "prompt": "Old row", "request": None},
     ])
     write_rows(stage_path(tmp_path, 7, "answers"), [
-        {"uid": u, "hotkey": f"hk{u}", "model_hash": f"m{u}", "prompt_id": p, "text": "4"}
+        # The lesson prompt's answer a course, so it passes the lesson task's format check (answer_format.py).
+        {"uid": u, "hotkey": f"hk{u}", "model_hash": f"m{u}", "prompt_id": p,
+         "text": json.dumps({"lessons": [{"lesson_number": 1, "title": "t", "body": "b", "source_ids": []}] * 3})
+         if p == "1" else "4"}
         for u in (1, 2) for p in ("1", "2", "3")
     ])
     seen = {}

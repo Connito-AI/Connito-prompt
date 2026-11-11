@@ -457,6 +457,13 @@ def test_the_levels_by_task_are_in_the_rules_hash(monkeypatch):
     assert snapshot.rules_sha256(pv, BASE) != before
 
 
+def test_the_format_rules_by_task_are_in_the_rules_hash(monkeypatch):
+    pv = PromptValidatorCfg(prompt_source="dataless")
+    before = snapshot.rules_sha256(pv, BASE)
+    monkeypatch.setitem(snapshot.FORMAT_RULES, "exp_lesson_residual", "exactly 4 lessons")
+    assert snapshot.rules_sha256(pv, BASE) != before
+
+
 # --- the report ---
 
 MODELS = [
