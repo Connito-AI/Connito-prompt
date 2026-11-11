@@ -450,6 +450,13 @@ def test_both_questions_are_in_the_rules_hash(monkeypatch):
     assert snapshot.rules_sha256(pv, BASE) != before
 
 
+def test_the_levels_by_task_are_in_the_rules_hash(monkeypatch):
+    pv = PromptValidatorCfg(prompt_source="dataless")
+    before = snapshot.rules_sha256(pv, BASE)
+    monkeypatch.setitem(snapshot.CRITERIA_BY_TASK, "exp_lesson_residual", ["0 Bad", "1 Good"])
+    assert snapshot.rules_sha256(pv, BASE) != before
+
+
 # --- the report ---
 
 MODELS = [

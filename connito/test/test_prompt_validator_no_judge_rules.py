@@ -56,6 +56,6 @@ def test_without_the_judges_rules_the_config_loads_and_the_judge_is_refused():
                for v in out["miner_defaults"].values()), out["miner_defaults"]
     # The judge-off pins (as in test_prompt_validator_loss_rank.py): judge off, the
     # hash is the one with the rules present.
-    assert out["off"] == "0f559554ca2006ff9053482d705a18312da0cf859e600e09652ccc6c05960332"
-    assert out["off_all"] == "29cab8437334a8eb6645635d5138d2b16b68fdebb2317e9a4a133f04191c5b9f"
+    assert out["off"] == "18df5bb8e0ca3d85179c4b4db7c11486d67c4f8df1e721a675067377a8cb1799"
+    assert out["off_all"] == "10f482f8487214468eed252e31593d31f438aff493c793d0bfb8dba20cdf769a"
     assert "judge_miner_prompts needs the judge's rules, judge_rules.json" in out["judge_on"]

@@ -735,7 +735,7 @@ def production(monkeypatch, tmp_path):
 
 
 def test_the_production_rules_hash_by_incentive_is_unchanged(production):
-    rules = "dfa6ca9484210eee72aa99f84b343376616af3cedb8645b7b5ee6d3da07d1111"
+    rules = "45d11fd0d5bcd235c0221ed2ab783074df52eda22f36a8cd46fcf325b900ac68"
 
     assert snapshot.rules_sha256(production, PRODUCTION_BASE) == rules
     loss_settings = {"loss_rank": LossRankCfg(min_scored=3, url="https://other.example/{uid}")}
@@ -746,7 +746,7 @@ def test_the_production_rules_hash_by_loss_is_pinned(production):
     loss = production.model_copy(update={"rank_by": "loss"})
 
     assert snapshot.rules_sha256(loss, PRODUCTION_BASE) == (
-        "289db8f2d4066927f119e232df3a68551bc4d66aa974c54aee15f5f21abb6dae")
+        "9f58efe51b4097bc30c054db96a837687ec7222a89c39c21a7a094972d633f27")
 
 
 @pytest.mark.parametrize("change", [
@@ -780,7 +780,7 @@ def test_the_loss_rules_hash_follows_the_selection_rule(production, monkeypatch)
 
 # --- model_selection: all ------------------------------------------------------------------------------------------
 
-ALL_RULES = "e2264645384f85f8470573722f0abb679315958920f6d680b137a847a0ecf40f"
+ALL_RULES = "343c29cb0c7387cac938030a5a699affaa9f2c6314e0fcf1d029a5a0e24b5c05"
 
 
 def test_the_production_rules_hash_with_every_model_is_pinned(production):
