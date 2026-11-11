@@ -773,7 +773,7 @@ def test_config_with_a_role_other_than_validator_does_not_load(tmp_path, monkeyp
 def test_the_hf_engines_rules_hash_is_pinned_and_ignores_a_vllm_section(tmp_path):
     # With engine "hf", a vllm section changes no snapshot's rules.
     pv = PromptValidatorCfg(prompts_path=Path("/prompts.jsonl"))
-    assert snapshot.rules_sha256(pv, _base()) == "18df5bb8e0ca3d85179c4b4db7c11486d67c4f8df1e721a675067377a8cb1799"
+    assert snapshot.rules_sha256(pv, _base()) == "112fef30cb4b6650617191bfb2035d2a9a0218909967435de8fbf63ff154ff58"
     vllm = VllmCfg(python=tmp_path / "python", checkpoint=tmp_path)
     assert snapshot.rules_sha256(pv.model_copy(update={"vllm": vllm}), _base()) == snapshot.rules_sha256(pv, _base())
 

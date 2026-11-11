@@ -19,6 +19,7 @@ from huggingface_hub import hf_hub_download
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from connito.prompt_validator import dataless, loss_rank
+from connito.prompt_validator.answer_format import FORMAT_RULES
 from connito.prompt_validator.config import GREEDY, JUDGE_RULES_DATA
 from connito.prompt_validator.cutoff import prompt_cycle_length, training_cycle_blocks
 from connito.prompt_validator.jev import CRITERIA_BY_TASK, SCORE_QUESTIONS
@@ -165,8 +166,8 @@ JUDGE_RULES = JUDGE_RULES_DATA.get("judge_rules")
 
 def rules_sha256(pv_cfg, base: dict) -> str:
     """Hash of what decides a score: the base model rows of the meta, the answer settings, the SCORE_FIELDS, the model
-    selection, copy and reward rules, the Jev questions and the levels by task and, when they are judged, how miner
-    prompts are judged."""
+    selection, copy and reward rules, the Jev questions, the levels and format rules by task and, when they are judged,
+    how miner prompts are judged."""
     settings = {field: get_nested_attr(pv_cfg, field) for field in SCORE_FIELDS}
     selection = {"model_selection": MODEL_SELECTION}
     if pv_cfg.model_selection == "all":  # no cap and no ranking: max_models and rank_by decide nothing
@@ -179,7 +180,7 @@ def rules_sha256(pv_cfg, base: dict) -> str:
         settings |= {"rank_by": "loss", "loss_selection": LOSS_SELECTION,
                      "loss_rank": pv_cfg.loss_rank.model_dump(mode="json", include=set(loss_rank.LOSS_FIELDS))}
     return _sha256_json({**base, "answer": answer_settings(pv_cfg), "jev_questions": SCORE_QUESTIONS,
-                         "jev_criteria_by_task": CRITERIA_BY_TASK,
+                         "jev_criteria_by_task": CRITERIA_BY_TASK, "format_rules_by_task": FORMAT_RULES,
                          **selection, "copy_reward": COPY_REWARD,
                          "reward_rule": REWARD_RULE, **settings})
 

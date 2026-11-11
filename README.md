@@ -1,7 +1,8 @@
 # Connito prompt validator
 
 The code that scores miners' models on task prompts on Connito, Bittensor subnet 102. Each prompt cycle it asks
-every committed model the cycle's prompts, has each answer graded, and ranks the models by their mean grade.
+every committed model the cycle's prompts, checks each answer's format where its task has one, has the answers
+graded, and ranks the models by their mean grade.
 
 This is one validator, published on its own. It does not replace [Connito](https://github.com/Connito-AI/Connito),
 which is still the subnet's main repository. The training validator there is still what sets weights on chain: it
@@ -23,9 +24,10 @@ behaviour. The guide for miners is at <https://doc.connito.ai/miner/prompt-evalu
   `rules_sha256` this release computes for production's settings, and the cycles production scores carry the same
   hash.
 - **Scoring rules have a fingerprint.** Everything that decides a grade is hashed into `rules_sha256`: the base
-  model, how answers are generated, which models are scored, the copy and reward rules, and Jev's version,
-  questions and levels by task (`CRITERIA_BY_TASK`). A cycle snapshotted under other rules cannot be scored. The tests pin the hash this release computes
-  for the production settings (`connito/test/test_prompt_validator_loss_rank.py`). If a cycle was scored under a
+  model, how answers are generated, which models are scored, the copy and reward rules, the format checks by task
+  (`FORMAT_RULES`), and Jev's version, questions and levels by task (`CRITERIA_BY_TASK`). A cycle snapshotted under
+  other rules cannot be scored. The tests pin the hash this release computes for the production settings
+  (`connito/test/test_prompt_validator_loss_rank.py`). If a cycle was scored under a
   hash this release can't produce, that cycle used newer rules.
 - **Read-only mirror.** Pull requests here can't be merged: the next release would overwrite them. Please open an
   issue instead, for a bug, a question about how you were scored, or a change you'd like. We'll answer there, and
@@ -53,8 +55,24 @@ models evaluated are the ones committed on chain at that block (`cutoff.py`).
 
    Production generates the answers through vLLM, with the same weights. `scripts/prompt_validator_vllm/` is that
    engine, and its README describes how it was checked against the Hugging Face path.
-5. **Grading.** Each answer is graded by **Jev**, TypeSafe's grading API, at a version pinned by name (`jev.py`).
-   Jev is given the prompt, and rates the answer on six levels from 0 to 5:
+5. **Format check** (`answer_format.py`). A task can have a format its answers must follow. An answer that fails
+   its task's check scores 0 and is not sent to Jev. Only `exp_lesson_residual` has one today, and its rule's
+   exact text is `FORMAT_RULES` in `answer_format.py`:
+   - the answer is read as JSON from its first `{`, so that `{` must open the course. Text before it and text after
+     the object are ignored, and control characters such as a raw newline or tab are allowed inside strings
+     (`json.JSONDecoder(strict=False)`). There is no other repair: broken quoting, a missing bracket, an answer cut
+     off at the token limit, or nesting too deep to decode fails;
+   - its `lessons` is a list of exactly 3 lessons. Each is an object with `lesson_number`, `title`, a string `body`
+     and a list `source_ids`. Other keys are allowed;
+   - a prompt's sources are its tags that begin `<source id="S1"`: an `S` and digits, in double quotes, as the tag's
+     first attribute. Every entry of a lesson's `source_ids` is a string naming one of them, and so is every inline
+     citation `[S1]` in its title or body. Ids are case-sensitive: `s1` and `[s1]` cite nothing the prompt has. A
+     lesson may cite nothing.
+
+   An answer to a prompt of any other task is not checked. A check that raises fails the answer, so no answer can
+   stop the stage.
+6. **Grading.** Every other answer is graded by **Jev**, TypeSafe's grading API, at a version pinned by name
+   (`jev.py`). Jev is given the prompt, and rates the answer on six levels from 0 to 5:
    - the prompts production scores come with no customer request, so the question sent is
      `QUALITY_QUESTION_NO_REQUEST` in `jev.py`, word for word;
    - the six level descriptions depend on the prompt's own task (its `customer_task_id`), because one cycle can hold
@@ -72,14 +90,16 @@ models evaluated are the ones committed on chain at that block (`cutoff.py`).
 
    `scores.py` stores two numbers per answer. `expected_score` is that grade, and it is the only one used: for
    the ranking, the reward and the published `jev_score`. `score` is Jev's own 0-to-5 score divided by 5, kept for
-   the record. It ranks nothing and earns nothing.
-6. **Ranking and reward** (`reward.py`):
+   the record. It ranks nothing and earns nothing. An answer that failed its format check has both at 0, and no
+   `jev_call_id`.
+7. **Ranking and reward** (`reward.py`):
    - a model's score is its mean grade over the cycle's prompts;
-   - to be ranked, a model needs a grade on at least 20 prompts (`reward_min_prompts`);
+   - to be ranked, a model needs a grade on at least 20 prompts (`reward_min_prompts`). An answer that failed its
+     format check counts, as a grade of 0;
    - the 3 best means share the reward in proportion to their means, and a tie for third includes every model
      tied;
    - a mean of 0 earns nothing.
-7. **Publishing.** The results go to the subnet's prompt API (`report.py`), where you can read them with
+8. **Publishing.** The results go to the subnet's prompt API (`report.py`), where you can read them with
    `GET /v1/miner/results`. The validator here sets no chain weights. The training validator blends these results
    into its own weights; that code is `connito/validator/prompt_blend.py` in the public Connito repository.
 
@@ -148,7 +168,8 @@ The vLLM engine itself runs in a separate environment, `requirements-vllm.lock` 
 | `connito/prompt_validator/fetch.py` | Downloading and checking each model's shard |
 | `connito/prompt_validator/answers.py` | Answering every prompt with each model |
 | `connito/prompt_validator/jev.py` | Jev's question, its levels by task, and the grading calls |
-| `connito/prompt_validator/scores.py` | One grade per answer |
+| `connito/prompt_validator/answer_format.py` | The format checks by task |
+| `connito/prompt_validator/scores.py` | One grade per answer, or 0 for one that fails its format check |
 | `connito/prompt_validator/reward.py` | Means, copies, ranking and shares |
 | `connito/prompt_validator/report.py`, `dataless.py` | Publishing results to the prompt API |
 | `connito/prompt_validator/loss_rank.py` | Ranking by training loss, for `model_selection: top` only |
