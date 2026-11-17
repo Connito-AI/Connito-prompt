@@ -54,6 +54,11 @@ prompt_validator:
     resolved: jev-1.14.0            # the Jev version asked for by name; a response from another version stops the loop
     # price_per_m: <USD>            # required to score: your price per million input tokens, for the spend cap
   set_weights: false                # must stay false: the prompt validator sets no chain weights in this phase
+  # lesson_length:                  # a lesson answer scores Jev's score x a multiplier (lesson_length.py); in the rules hash
+  #   enabled: true                 # default false: scores and the rules hash as before
+  #   default_limit: 200            # words per lesson body when the prompt states no single limit
+  #   cutoff: 300                   # words at which the multiplier reaches 0, falling linearly from the limit
+  #   aggregate: longest            # the longest lesson's count, or "mean" of the three
   # weights:                        # a dry run after report: runs/<cycle>/weights/weights.jsonl; it never sets weights
   #                                 # --loop --test cycles are measured too, against the real chain's row
   #   mode: dry_run                 # default off; on is refused

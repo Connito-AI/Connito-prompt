@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 
+from connito.prompt_validator.lesson_length import LABELS, course_multiplier
 from connito.shared.app_logging import structlog
 
 logger = structlog.get_logger(__name__)
@@ -77,3 +78,34 @@ def format_ok(task: str | None, text: str, prompt: str) -> bool:
     except Exception as e:  # fail closed: an answer that breaks its check scores 0
         logger.warning("format check raised", task=task, error=type(e).__name__)
         return False
+
+
+# With lesson_length on, a lesson task's answer that passed its format check scores Jev's score times a length
+# multiplier (lesson_length.py). In the rules hash, with the lesson_length settings, only while it is on.
+LENGTH_RULES = {
+    "exp_lesson_residual": (
+        "each lesson body's words: the body string with a style label removed from the start of each line ("
+        + ", ".join(repr(label) for label in LABELS) + ", after any leading spaces or tabs), every [Sn] or [Sn, Sm] "
+        "marker replaced by a space, then split on whitespace, a piece counting if it holds a \\w character; the "
+        "limit is the prompt's one 'each lesson body is plain text of at most N words' before its first "
+        "<learner_request> or <source> tag, if N is under cutoff, else default_limit; the multiplier is 1 at or "
+        "under the limit, (cutoff - words) / (cutoff - limit) between, 0 at or past cutoff, on the longest lesson's "
+        "count or the lessons' mean (aggregate); score and expected_score are Jev's times the multiplier, rounded to "
+        "4 places, and rank follows them; an answer that fails its format check still scores 0"
+    ),
+}
+# Added to every score row while lesson_length is on: Jev's own scores, and what the multiplier was taken from.
+LENGTH_FIELDS = ("jev_score", "jev_expected_score", "word_counts", "word_limit", "length_multiplier")
+
+
+def apply_lesson_length(row: dict, task: str | None, prompt: str, checked: bool, cfg) -> dict:
+    """`row` (a score row with its answer's text) with LENGTH_FIELDS, and its scores times the length multiplier when
+    its task has a length rule and its answer passed the format check (`checked`); else its scores as they are."""
+    raw = {"jev_score": row["score"] if checked else None,
+           "jev_expected_score": row["expected_score"] if checked else None}
+    if task not in LENGTH_RULES or not checked:
+        return row | raw | {"word_counts": None, "word_limit": None, "length_multiplier": None}
+    m, counts, limit = course_multiplier(row["text"], prompt, cfg.cutoff, cfg.aggregate, cfg.default_limit)
+    m = round(m, 4)
+    return row | raw | {"word_counts": counts, "word_limit": limit, "length_multiplier": m,
+                        "score": round(row["score"] * m, 4), "expected_score": round(row["expected_score"] * m, 4)}

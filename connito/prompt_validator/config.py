@@ -12,6 +12,7 @@ import huggingface_hub.constants
 from bittensor.sp_core import KeyfileError, get_password_from_environment
 from pydantic import ConfigDict, Field, NonNegativeFloat, PositiveInt, field_validator, model_validator
 
+from connito.prompt_validator.lesson_length import DEFAULT_CUTOFF, DEFAULT_LIMIT
 from connito.prompt_validator.stage_io import under_root
 from connito.shared.config import BaseConfig, ChainCfg, ValidatorConfig
 
@@ -162,6 +163,25 @@ class MinerPromptsCfg(BaseConfig):
         return self
 
 
+class LessonLengthCfg(BaseConfig):
+    """The lesson length multiplier (answer_format.apply_lesson_length): a lesson task's Jev score times a multiplier
+    that is 1 at or under the prompt's word limit and falls linearly to 0 at `cutoff` words. All in the rules hash while
+    it is on; off, every file and the rules hash are as before it existed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    default_limit: PositiveInt = DEFAULT_LIMIT  # words per lesson body, when the prompt states no single limit
+    cutoff: PositiveInt = DEFAULT_CUTOFF  # words at which the multiplier reaches 0
+    aggregate: Literal["longest", "mean"] = "longest"  # the count it is taken on: the longest lesson's, or the mean
+
+    @model_validator(mode="after")
+    def _cutoff_above_limit(self) -> LessonLengthCfg:
+        if self.cutoff <= self.default_limit:
+            raise ValueError(f"cutoff {self.cutoff} must be above default_limit {self.default_limit}")
+        return self
+
+
 class WeightsCfg(BaseConfig):
     """The weights stage (weights.py): a dry run that only reads the chain. Not in rules_sha256: it decides no score."""
 
@@ -257,6 +277,7 @@ class PromptValidatorCfg(BaseConfig):
     # Judge the cycle's miner prompts (the judge stage). Off, every file and the rules hash are as before it existed.
     judge_miner_prompts: bool = False
     miner_prompts: MinerPromptsCfg = Field(default_factory=MinerPromptsCfg)
+    lesson_length: LessonLengthCfg = Field(default_factory=LessonLengthCfg)
     weights: WeightsCfg = Field(default_factory=WeightsCfg)
 
     @field_validator("prompts_path")

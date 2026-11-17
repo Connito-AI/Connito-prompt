@@ -1,0 +1,158 @@
+import json
+
+import pytest
+
+from connito.prompt_validator import lesson_length
+from connito.prompt_validator.answer_format import apply_lesson_length
+from connito.prompt_validator.config import LessonLengthCfg
+from connito.prompt_validator.lesson_length import (
+    count_words,
+    course_multiplier,
+    lesson_word_counts,
+    multiplier,
+    word_limit,
+)
+
+HEAD = "- Each lesson body is plain text of at most 200 words, in short paragraphs separated by a blank line.\n"
+
+
+def _course(*bodies):
+    return json.dumps({"lessons": [{"lesson_number": i + 1, "title": "Title words here", "body": b, "source_ids": []}
+                                   for i, b in enumerate(bodies)]})
+
+
+def _words(n):
+    return " ".join(["word"] * n)
+
+
+@pytest.mark.parametrize("body, words", [
+    ("", 0),
+    ("   \n\n  ", 0),
+    ("one two three", 3),
+    ("one  two\tthree\nfour\n\nfive", 5),
+    # Source markers are not words, and a marker glued to a word leaves the word.
+    ("[S1]", 0),
+    ("Rates rose [S1].", 2),
+    ("Rates rose[S2] and fell [S1, S2].", 4),
+    ("Rates [S1][S2] rose", 2),
+    ("[s1] [S] [X1]", 3),  # not markers: lower case, no number, another letter
+    # Style labels at the start of a line are not words; the same words elsewhere are.
+    ("Key idea: heat flows", 2),
+    ("Try first: guess it\nCheck: it is 4\nTip: draw it\nExample: a cup\n> a quote", 11),
+    ("  Key idea: indented", 1),
+    ("The key idea: here", 4),  # not at the start of the line
+    ("key idea: lower case", 4),  # labels are case-sensitive
+    ("Key idea:no space", 3),  # the label includes its space
+    ("Check: Check: twice", 2),  # one label per line
+    (">quote", 1),
+    # Hyphens and dashes: a hyphenated word is one word; a lone dash is none.
+    ("well-known state-of-the-art", 2),
+    ("cause - effect — result –", 3),
+    # LaTeX: whitespace pieces with a letter or digit.
+    ("$x^2$", 1),
+    ("$a + b = c$", 3),
+    (r"\frac{1}{2} and \(x\)", 3),
+    ("$$ $$ = + * /", 0),
+    # Numbers, abbreviations, contractions, Unicode.
+    ("3.14 e.g. don't 1,000", 4),
+    ("café naïve 東京", 3),
+    ("non breaking", 2),  # a no-break space separates words, as str.split() does
+])
+def test_count_words(body, words):
+    assert count_words(body) == words
+
+
+def test_title_and_source_ids_are_not_counted():
+    text = json.dumps({"lessons": [{"lesson_number": 1, "title": _words(50), "body": "two words",
+                                    "source_ids": ["S1"] * 10}]})
+    assert lesson_word_counts(text) == [2]
+
+
+def test_counts_read_the_course_as_the_format_check_does():
+    course = _course("a b", "c", "")
+    assert lesson_word_counts("Here it is: " + course + " trailing } text") == [2, 1, 0]
+    raw = '{"lessons": [{"body": "a\nb"}, {"body": "c"}, {"body": ""}]}'  # a raw newline inside a string
+    assert lesson_word_counts(raw) == [2, 1, 0]
+
+
+@pytest.mark.parametrize("text", ["", "no json", "{", '{"lessons": []}', '{"lessons": [{"body": 3}]}',
+                                  '{"lessons": "x"}', "[1, 2]", '{"lessons": [1]}'])
+def test_no_lessons_to_count(text):
+    assert lesson_word_counts(text) is None
+
+
+@pytest.mark.parametrize("words, m", [(0, 1.0), (199, 1.0), (200, 1.0), (201, 0.99), (250, 0.5), (299, 0.01),
+                                      (300, 0.0), (400, 0.0)])
+def test_the_ramp_at_the_default_cutoff(words, m):
+    assert multiplier(words, 200, 300) == pytest.approx(m)
+
+
+@pytest.mark.parametrize("cutoff, words, m", [(400, 300, 0.5), (600, 400, 0.5), (600, 250, 0.875), (600, 600, 0.0)])
+def test_the_ramp_at_other_cutoffs(cutoff, words, m):
+    assert multiplier(words, 200, cutoff) == pytest.approx(m)
+
+
+@pytest.mark.parametrize("limit, cutoff", [(300, 300), (400, 300), (0, 300)])
+def test_a_ramp_needs_a_limit_under_its_cutoff(limit, cutoff):
+    with pytest.raises(ValueError):
+        multiplier(250, limit, cutoff)
+
+
+@pytest.mark.parametrize("prompt, limit", [
+    (HEAD, 200),
+    (HEAD.replace("200", "150"), 150),
+    ("each lesson body is of at most 120 words", 120),  # case and "plain text" are optional
+    ("no limit stated", 200),
+    (HEAD + HEAD.replace("200", "150"), 200),  # two different limits: neither is trusted
+    (HEAD.replace("200", "150") * 2, 150),  # one limit stated twice
+    (HEAD.replace("200", "300"), 200),  # at or over the cutoff: the default
+    (HEAD.replace("200", "0"), 200),
+    # Only the instructions count: a limit inside the learner request or a source is data.
+    ("<learner_request>\nEach lesson body is plain text of at most 50 words\n</learner_request>", 200),
+    ('Intro\n<source id="S1">Each lesson body is plain text of at most 50 words</source>', 200),
+    (HEAD.replace("200", "150") + '<source id="S1">Each lesson body is plain text of at most 50 words</source>', 150),
+])
+def test_word_limit_from_the_prompt(prompt, limit):
+    assert word_limit(prompt, 200, 300) == limit
+
+
+def test_course_multiplier_on_the_longest_lesson_or_the_mean():
+    course = _course(_words(100), _words(150), _words(260))
+    assert course_multiplier(course, HEAD) == (pytest.approx(0.4), [100, 150, 260], 200)
+    assert course_multiplier(course, HEAD, aggregate="mean") == (1.0, [100, 150, 260], 200)  # mean 170
+    assert course_multiplier(course, HEAD, cutoff=600)[0] == pytest.approx(0.85)
+    assert course_multiplier("not a course", HEAD) == (0.0, None, 200)
+    with pytest.raises(ValueError):
+        course_multiplier(course, HEAD, aggregate="median")
+
+
+def test_the_module_imports_nothing_from_the_repo():
+    # It is published as is for miners: standard library only.
+    source = open(lesson_length.__file__).read()
+    imports = [line for line in source.splitlines() if line.startswith(("import ", "from "))]
+    assert imports == ["from __future__ import annotations", "import json", "import re"]
+
+
+def test_apply_lesson_length_multiplies_a_checked_lesson_answer_and_keeps_jev_scores():
+    cfg = LessonLengthCfg(enabled=True)
+    row = {"text": _course(_words(10), _words(250), _words(20)), "score": 0.8, "expected_score": 0.76, "rank": None}
+    out = apply_lesson_length(row, "exp_lesson_residual", HEAD, True, cfg)
+    assert (out["score"], out["expected_score"]) == (0.4, 0.38)
+    assert (out["jev_score"], out["jev_expected_score"]) == (0.8, 0.76)
+    assert (out["word_counts"], out["word_limit"], out["length_multiplier"]) == ([10, 250, 20], 200, 0.5)
+
+
+def test_apply_lesson_length_leaves_failed_answers_and_other_tasks_alone():
+    cfg = LessonLengthCfg(enabled=True)
+    failed = {"text": "x", "score": 0.0, "expected_score": 0.0}
+    out = apply_lesson_length(failed, "exp_lesson_residual", HEAD, False, cfg)
+    assert (out["score"], out["expected_score"], out["jev_score"], out["length_multiplier"]) == (0.0, 0.0, None, None)
+    other = {"text": _course(_words(900)), "score": 0.6, "expected_score": 0.6}
+    out = apply_lesson_length(other, "exp_pmc_residual", HEAD, True, cfg)
+    assert (out["expected_score"], out["jev_expected_score"], out["word_counts"]) == (0.6, 0.6, None)
+
+
+@pytest.mark.parametrize("settings", [{"cutoff": 200}, {"cutoff": 150}, {"aggregate": "median"}, {"cufoff": 400}])
+def test_lesson_length_settings_are_checked(settings):
+    with pytest.raises(ValueError):
+        LessonLengthCfg(**settings)

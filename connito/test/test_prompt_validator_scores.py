@@ -231,3 +231,71 @@ def test_a_deeply_nested_lesson_answer_scores_0_and_the_stage_completes(config, 
     assert (rows[(2, "p1")]["expected_score"], rows[(2, "p1")]["jev_call_id"]) == (0.0, None)
     assert deep not in [q["instructions"]["answer"] for b in fake.bodies for q in b["questions"].values()]
     assert rows[(2, "p2")]["expected_score"] == pytest.approx(1.0)
+
+
+def _lesson_cycle(config, fake, monkeypatch, bodies_by_hash):
+    """p1 becomes a lesson prompt with a 200-word limit; each model_hash answers it with a course of these bodies, which
+    Jev scores 5 (the fake scores an answer "n" as n)."""
+    pv = config.prompt_validator
+    snapshot_dir = stage_path(pv.runs_dir, CYCLE_ID, "snapshot").parent
+    head = "- Each lesson body is plain text of at most 200 words.\n"
+    write_rows(snapshot_dir / "prompts.jsonl", [
+        {**p, "customer_task_id": "exp_lesson_residual", "prompt": head} if p["prompt_id"] == "p1" else p
+        for p in read_rows(snapshot_dir / "prompts.jsonl")
+    ])
+    courses = {h: json.dumps({"lessons": [{"lesson_number": i, "title": "t", "body": " ".join(["w"] * n),
+                                           "source_ids": []} for i, n in enumerate(bodies, 1)]})
+               for h, bodies in bodies_by_hash.items()}
+    answers_path = stage_path(pv.runs_dir, CYCLE_ID, "answers")
+    write_rows(answers_path, [{**a, "text": courses[a["model_hash"]]} if a["prompt_id"] == "p1" else a
+                              for a in read_rows(answers_path)])
+
+    def post(url, json=None, **kwargs):
+        for q in json["questions"].values():
+            if q["instructions"]["answer"] in courses.values():
+                q["instructions"]["answer"] = "5"
+        return fake.post(url, json=json, **kwargs)
+
+    monkeypatch.setattr(requests, "post", post)
+    write_rows(snapshot_dir / "snapshot.jsonl", [{**BASE, "rules_sha256": snapshot.rules_sha256(pv, BASE)}])
+
+
+def test_with_lesson_length_on_a_long_course_scores_jev_times_its_multiplier_and_ranks_by_it(config, fake,
+                                                                                              monkeypatch):
+    pv = config.prompt_validator
+    pv.lesson_length = pv.lesson_length.model_copy(update={"enabled": True})
+    # h1's longest lesson is 250 words: x0.5. h2's are all within 200: x1.
+    _lesson_cycle(config, fake, monkeypatch, {"h1": [120, 250, 90], "h2": [200, 180, 150]})
+
+    run.run_stages(config, CYCLE_ID, "scores")
+
+    rows = {(r["uid"], r["prompt_id"]): r for r in _scores(config)}
+    h1, h2 = rows[(1, "p1")], rows[(2, "p1")]
+    assert (h1["jev_score"], h1["jev_expected_score"]) == (1.0, 1.0)
+    assert (h1["score"], h1["expected_score"], h1["length_multiplier"]) == (0.5, 0.5, 0.5)
+    assert (h1["word_counts"], h1["word_limit"]) == ([120, 250, 90], 200)
+    assert (h2["expected_score"], h2["length_multiplier"], h2["word_counts"]) == (1.0, 1.0, [200, 180, 150])
+    assert (h2["rank"], h1["rank"], rows[(3, "p1")]["rank"]) == (0, 1, 1)  # ranked on the multiplied scores
+    # p2 has no length rule: Jev's score as it is, and no counts.
+    assert (rows[(2, "p2")]["expected_score"], rows[(2, "p2")]["jev_expected_score"]) == (1.0, 1.0)
+    assert rows[(2, "p2")]["word_counts"] is None and rows[(2, "p2")]["length_multiplier"] is None
+
+
+def test_with_lesson_length_off_the_rows_are_as_before(config, fake, monkeypatch):
+    _lesson_cycle(config, fake, monkeypatch, {"h1": [120, 250, 90], "h2": [200, 180, 150]})
+
+    run.run_stages(config, CYCLE_ID, "scores")
+
+    rows = _scores(config)
+    assert all(list(r) == ["uid", "hotkey", "model_hash", "prompt_id", "score", "expected_score", "rank",
+                           "jev_call_id"] for r in rows)
+    assert {r["expected_score"] for r in rows if r["prompt_id"] == "p1"} == {1.0}
+
+
+def test_a_lesson_length_turned_on_after_the_snapshot_is_refused(config, fake, monkeypatch):
+    _lesson_cycle(config, fake, monkeypatch, {"h1": [120], "h2": [200]})
+    pv = config.prompt_validator
+    pv.lesson_length = pv.lesson_length.model_copy(update={"enabled": True})
+
+    with pytest.raises(RuntimeError, match="score-deciding settings changed"):
+        run.run_stages(config, CYCLE_ID, "scores")

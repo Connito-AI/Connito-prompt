@@ -13,7 +13,7 @@ from bittensor.sp_core import Keypair
 from pydantic import ValidationError
 
 from connito.prompt_validator import cutoff, reward, run, snapshot
-from connito.prompt_validator.config import PromptValidatorCfg, PromptValidatorConfig, VllmCfg
+from connito.prompt_validator.config import LessonLengthCfg, PromptValidatorCfg, PromptValidatorConfig, VllmCfg
 from connito.prompt_validator.stage_io import read_rows, stage_path, write_rows
 from connito.shared.checkpoints import ChainCheckpoint, ChainCheckpoints
 from connito.shared.config import CycleCfg, ModelCfg, ResidualCfg
@@ -510,6 +510,21 @@ def test_rules_hash_follows_the_decoding(tmp_path, monkeypatch):
     monkeypatch.setattr(snapshot, "GREEDY", {"do_sample": True})
 
     assert snapshot.rules_sha256(pv, _base()) != greedy
+
+
+def test_rules_hash_follows_the_lesson_length_rule_only_while_it_is_on(tmp_path, monkeypatch):
+    pv = PromptValidatorCfg(prompts_path=tmp_path / "prompts.jsonl")
+    off = snapshot.rules_sha256(pv, _base())
+    # Off, its settings decide nothing.
+    assert snapshot.rules_sha256(pv.model_copy(update={"lesson_length": LessonLengthCfg(cutoff=600)}), _base()) == off
+    on = pv.model_copy(update={"lesson_length": LessonLengthCfg(enabled=True)})
+    rules = snapshot.rules_sha256(on, _base())
+    assert rules != off
+    for change in ({"cutoff": 400}, {"default_limit": 150}, {"aggregate": "mean"}):
+        changed = on.model_copy(update={"lesson_length": LessonLengthCfg(enabled=True, **change)})
+        assert snapshot.rules_sha256(changed, _base()) != rules
+    monkeypatch.setattr(snapshot, "LENGTH_RULES", {"exp_lesson_residual": "another rule"})
+    assert snapshot.rules_sha256(on, _base()) != rules
 
 
 def test_rules_hash_ignores_what_decides_no_score(tmp_path):
