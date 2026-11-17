@@ -10,7 +10,7 @@ The cache is shared across cycles, so a row's jev_call_id may be logged in an ea
 """
 from __future__ import annotations
 
-from connito.prompt_validator.answer_format import format_ok
+from connito.prompt_validator.answer_format import LENGTH_FIELDS, apply_lesson_length, format_ok
 from connito.prompt_validator.jev import cycle_client
 from connito.prompt_validator.judge import selected_prompts
 from connito.prompt_validator.snapshot import snapshot_meta
@@ -22,6 +22,7 @@ logger = structlog.get_logger(__name__)
 # score and expected_score are on 0 to 1 (see jev.py). rank is the answer's place among this cycle's models' answers to
 # the same prompt by expected_score, 0 for the best: one answer per model_hash, so copies take no place. Equal scores
 # share a rank, and the next rank skips (0, 0, 2). jev_call_id is null for an answer that failed its format check.
+# With lesson_length on, score and expected_score are Jev's times the length multiplier, and LENGTH_FIELDS follow.
 ROW_FIELDS = ("uid", "hotkey", "model_hash", "prompt_id", "score", "expected_score", "rank", "jev_call_id")
 FORMAT_FAILED = {"score": 0.0, "expected_score": 0.0, "jev_call_id": None}
 
@@ -52,9 +53,18 @@ def run_scores(config, scoring_cycle_id: int) -> list[dict]:
     logger.info("format checked", answers=len(answers), failed=len(answers) - len(sent))
     # Without `cached`, so the rows depend only on the answers and the Jev pin, not on what a rerun found cached.
     rows = [a | r for a, r in zip(answers, results, strict=True)]
+    fields = ROW_FIELDS
+    if pv.lesson_length.enabled:  # after Jev, before ranking: rank and reward follow the multiplied scores
+        checked = set(sent)
+        rows = [apply_lesson_length(row, task, prompts[row["prompt_id"]]["prompt"], i in checked, pv.lesson_length)
+                for i, (row, task) in enumerate(zip(rows, tasks, strict=True))]
+        fields = (*ROW_FIELDS, *LENGTH_FIELDS)
+        logger.info("lesson length applied", answers=len(rows),
+                    penalised=sum((r["length_multiplier"] or 1.0) < 1 for r in rows),
+                    zeroed=sum(r["length_multiplier"] == 0 for r in rows))
     by_prompt: dict[str, dict[str, float]] = {}
     for row in rows:
         by_prompt.setdefault(row["prompt_id"], {})[row["model_hash"]] = row["expected_score"]
     for row in rows:
         row["rank"] = sum(other > row["expected_score"] for other in by_prompt[row["prompt_id"]].values())
-    return [{field: row[field] for field in ROW_FIELDS} for row in rows]
+    return [{field: row[field] for field in fields} for row in rows]

@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from connito.prompt_validator import jev
-from connito.prompt_validator.config import JevCfg
+from connito.prompt_validator.config import JevCfg, LessonLengthCfg
 from connito.prompt_validator.stage_io import read_rows, stage_path, write_rows
 from connito.shared import helper
 
@@ -457,7 +457,7 @@ def test_the_scores_stage_passes_each_prompt_s_own_task(monkeypatch, tmp_path):
     monkeypatch.setattr(scores, "snapshot_meta", lambda config, cycle: {})
     monkeypatch.setattr(scores, "selected_prompts", lambda pv, cycle: [])
     monkeypatch.setattr(scores, "cycle_client", lambda pv, cycle: Client())
-    config = SimpleNamespace(prompt_validator=SimpleNamespace(runs_dir=tmp_path))
+    config = SimpleNamespace(prompt_validator=SimpleNamespace(runs_dir=tmp_path, lesson_length=LessonLengthCfg()))
 
     assert len(scores.run_scores(config, 7)) == 6
     assert seen["tasks"] == [LESSON, "exp_pmc_residual", None] * 2

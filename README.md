@@ -25,7 +25,8 @@ behaviour. The guide for miners is at <https://doc.connito.ai/miner/prompt-evalu
   hash.
 - **Scoring rules have a fingerprint.** Everything that decides a grade is hashed into `rules_sha256`: the base
   model, how answers are generated, which models are scored, the copy and reward rules, the format checks by task
-  (`FORMAT_RULES`), and Jev's version, questions and levels by task (`CRITERIA_BY_TASK`). A cycle snapshotted under
+  (`FORMAT_RULES`), Jev's version, questions and levels by task (`CRITERIA_BY_TASK`), and, when it is on, the
+  lesson length multiplier's settings and rule (`lesson_length`, `LENGTH_RULES`). A cycle snapshotted under
   other rules cannot be scored. The tests pin the hash this release computes for the production settings
   (`connito/test/test_prompt_validator_loss_rank.py`). If a cycle was scored under a
   hash this release can't produce, that cycle used newer rules.
@@ -92,14 +93,50 @@ models evaluated are the ones committed on chain at that block (`cutoff.py`).
    the ranking, the reward and the published `jev_score`. `score` is Jev's own 0-to-5 score divided by 5, kept for
    the record. It ranks nothing and earns nothing. An answer that failed its format check has both at 0, and no
    `jev_call_id`.
-7. **Ranking and reward** (`reward.py`):
+7. **Lesson length** (`lesson_length.py`). When `lesson_length.enabled` is on, a checked `exp_lesson_residual`
+   answer's grade is multiplied by a length multiplier. Production turns it on from prompt cycle 1398, with
+   `aggregate: mean` and `cutoff: 300`, under `rules_sha256`
+   `b66c2e36b39f3f3ad0c268ba23917efcd0f244928901667a2735c8f238a7dbb3`. The code's default is off, and the tests pin
+   the hash with it off.
+   - **What counts.** Only each lesson's `body`: not its title, its `source_ids` or any text outside the course
+     JSON. A style label at the start of a line is removed: `Key idea: `, `Try first: `, `Check: `, `Tip: `,
+     `Example: ` or `> `, exactly so (case and the space after it included), after any spaces or tabs that open the
+     line. Every source marker, `[S1]` or a list such as `[S1, S2]`, is replaced by a space. The rest is split on
+     whitespace, and a piece is a word if it holds at least one letter, digit or underscore. So `well-known`,
+     `e.g.`, `3.14` and `don't` are one word each, a lone `-` or `—` is none, and `$a + b$` is two.
+   - **The limit** is the one the prompt's instructions state ("Each lesson body is plain text of at most 200
+     words"), read only before its learner request and sources, if they state exactly one under the cutoff; else
+     200.
+   - **The multiplier** is 1 at or under the limit, falls in a straight line to 0 at `cutoff` words, and is 0
+     past it. `aggregate` decides which count it is taken on: `mean`, the mean of the three lessons' counts
+     (production's), or `longest`, the longest lesson's (the code's default).
+   - **Examples**, with production's settings (limit 200, cutoff 300, the lessons' mean):
+
+     | Mean words per lesson | 199 | 200 | 250 | 300 | 400 |
+     |---|---|---|---|---|---|
+     | Multiplier | 1.0 | 1.0 | 0.5 | 0.0 | 0.0 |
+
+     A grade of 0.80 on an answer whose lessons have 230, 260 and 270 words (mean 253.3) becomes
+     0.80 × 0.467 = 0.373.
+   - **Check your own answers.** `lesson_length.py` uses only Python's standard library, so it can be copied and
+     run on its own:
+
+     ```python
+     from lesson_length import course_multiplier
+     multiplier, counts, limit = course_multiplier(answer_text, prompt_text, cutoff=300, aggregate="mean")
+     ```
+
+   The results keep Jev's own grade beside the multiplied one (`jev_score`, `jev_expected_score`), with
+   `word_counts`, `word_limit` and `length_multiplier`. The multiplied grade is the one ranked and published.
+   An answer that failed its format check stays at 0.
+8. **Ranking and reward** (`reward.py`):
    - a model's score is its mean grade over the cycle's prompts;
    - to be ranked, a model needs a grade on at least 20 prompts (`reward_min_prompts`). An answer that failed its
      format check counts, as a grade of 0;
    - the 3 best means share the reward in proportion to their means, and a tie for third includes every model
      tied;
    - a mean of 0 earns nothing.
-8. **Publishing.** The results go to the subnet's prompt API (`report.py`), where you can read them with
+9. **Publishing.** The results go to the subnet's prompt API (`report.py`), where you can read them with
    `GET /v1/miner/results`. The validator here sets no chain weights. The training validator blends these results
    into its own weights; that code is `connito/validator/prompt_blend.py` in the public Connito repository.
 
@@ -169,6 +206,7 @@ The vLLM engine itself runs in a separate environment, `requirements-vllm.lock` 
 | `connito/prompt_validator/answers.py` | Answering every prompt with each model |
 | `connito/prompt_validator/jev.py` | Jev's question, its levels by task, and the grading calls |
 | `connito/prompt_validator/answer_format.py` | The format checks by task |
+| `connito/prompt_validator/lesson_length.py` | Lesson word counts and the length multiplier (standard library only) |
 | `connito/prompt_validator/scores.py` | One grade per answer, or 0 for one that fails its format check |
 | `connito/prompt_validator/reward.py` | Means, copies, ranking and shares |
 | `connito/prompt_validator/report.py`, `dataless.py` | Publishing results to the prompt API |

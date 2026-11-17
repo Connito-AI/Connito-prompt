@@ -19,7 +19,7 @@ from huggingface_hub import hf_hub_download
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from connito.prompt_validator import dataless, loss_rank
-from connito.prompt_validator.answer_format import FORMAT_RULES
+from connito.prompt_validator.answer_format import FORMAT_RULES, LENGTH_RULES
 from connito.prompt_validator.config import GREEDY, JUDGE_RULES_DATA
 from connito.prompt_validator.cutoff import prompt_cycle_length, training_cycle_blocks
 from connito.prompt_validator.jev import CRITERIA_BY_TASK, SCORE_QUESTIONS
@@ -166,13 +166,16 @@ JUDGE_RULES = JUDGE_RULES_DATA.get("judge_rules")
 
 def rules_sha256(pv_cfg, base: dict) -> str:
     """Hash of what decides a score: the base model rows of the meta, the answer settings, the SCORE_FIELDS, the model
-    selection, copy and reward rules, the Jev questions, the levels and format rules by task and, when they are judged,
-    how miner prompts are judged."""
+    selection, copy and reward rules, the Jev questions, the levels and format rules by task, the lesson length rule
+    while it is on and, when they are judged, how miner prompts are judged."""
     settings = {field: get_nested_attr(pv_cfg, field) for field in SCORE_FIELDS}
     selection = {"model_selection": MODEL_SELECTION}
     if pv_cfg.model_selection == "all":  # no cap and no ranking: max_models and rank_by decide nothing
         del settings["max_models"]
         selection = {"model_selection": ALL_SELECTION, "model_selection_mode": "all"}
+    if pv_cfg.lesson_length.enabled:  # only then: off, the hash stays the one from before the length multiplier
+        settings |= {"lesson_length": pv_cfg.lesson_length.model_dump(mode="json"),
+                     "length_rules_by_task": LENGTH_RULES}
     if pv_cfg.judge_miner_prompts:  # only then: off, the hash stays the one from before miner prompts were judged
         settings |= {"miner_prompts": pv_cfg.miner_prompts.model_dump(mode="json"), "judge_rules": JUDGE_RULES}
     # Only then: by incentive, or with "all", the hash stays one without the loss settings.
