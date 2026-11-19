@@ -10,9 +10,9 @@ from urllib.parse import urlsplit
 import bittensor
 import huggingface_hub.constants
 from bittensor.sp_core import KeyfileError, get_password_from_environment
-from pydantic import ConfigDict, Field, NonNegativeFloat, PositiveInt, field_validator, model_validator
+from pydantic import ConfigDict, Field, NonNegativeFloat, NonNegativeInt, PositiveInt, field_validator, model_validator
 
-from connito.prompt_validator.lesson_length import DEFAULT_CUTOFF, DEFAULT_LIMIT
+from connito.prompt_validator.lesson_length import DEFAULT_CUTOFF, DEFAULT_LIMIT, DEFAULT_RAMP, DEFAULT_TOLERANCE
 from connito.prompt_validator.stage_io import under_root
 from connito.shared.config import BaseConfig, ChainCfg, ValidatorConfig
 
@@ -165,8 +165,9 @@ class MinerPromptsCfg(BaseConfig):
 
 class LessonLengthCfg(BaseConfig):
     """The lesson length multiplier (answer_format.apply_lesson_length): a lesson task's Jev score times a multiplier
-    that is 1 at or under the prompt's word limit and falls linearly to 0 at `cutoff` words. All in the rules hash while
-    it is on; off, every file and the rules hash are as before it existed."""
+    that is 1 at or under the prompt's word limit and falls linearly to 0 at `cutoff` words, or, for a prompt that
+    states a word target, 1 within `target_tolerance` of it and 0 past it (or a linear fall over `target_ramp` words).
+    All in the rules hash while it is on; off, every file and the rules hash are as before it existed."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -174,12 +175,35 @@ class LessonLengthCfg(BaseConfig):
     default_limit: PositiveInt = DEFAULT_LIMIT  # words per lesson body, when the prompt states no single limit
     cutoff: PositiveInt = DEFAULT_CUTOFF  # words at which the multiplier reaches 0
     aggregate: Literal["longest", "mean"] = "longest"  # the count it is taken on: the longest lesson's, or the mean
+    target_tolerance: NonNegativeInt = DEFAULT_TOLERANCE  # words either side of a prompt's target that still score 1
+    target_ramp: NonNegativeInt = DEFAULT_RAMP  # words past the tolerance over which it falls to 0; 0: straight to 0
 
     @model_validator(mode="after")
     def _cutoff_above_limit(self) -> LessonLengthCfg:
         if self.cutoff <= self.default_limit:
             raise ValueError(f"cutoff {self.cutoff} must be above default_limit {self.default_limit}")
         return self
+
+
+class ScoringMethodCfg(BaseConfig):
+    """A task's judging method: a name in methods.REGISTRY, with that method's settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: str = "plain_levels"
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _known_method(self) -> ScoringMethodCfg:
+        self.parsed()  # an unknown method or a bad setting fails the config load, not a cycle
+        return self
+
+    def parsed(self):
+        from connito.prompt_validator.methods import REGISTRY  # here: the methods import jev, which imports this module
+
+        if self.method not in REGISTRY:
+            raise ValueError(f"unknown scoring method {self.method!r}; known: {sorted(REGISTRY)}")
+        return REGISTRY[self.method].Settings(**self.settings)
 
 
 class WeightsCfg(BaseConfig):
@@ -278,6 +302,8 @@ class PromptValidatorCfg(BaseConfig):
     judge_miner_prompts: bool = False
     miner_prompts: MinerPromptsCfg = Field(default_factory=MinerPromptsCfg)
     lesson_length: LessonLengthCfg = Field(default_factory=LessonLengthCfg)
+    # customer_task_id -> its judging method; a task not listed is scored by plain_levels.
+    scoring_methods: dict[str, ScoringMethodCfg] = Field(default_factory=dict)
     weights: WeightsCfg = Field(default_factory=WeightsCfg)
 
     @field_validator("prompts_path")

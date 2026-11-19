@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 
-from connito.prompt_validator.lesson_length import LABELS, course_multiplier
+from connito.prompt_validator.lesson_length import LABELS, course_multiplier, word_target
 from connito.shared.app_logging import structlog
 
 logger = structlog.get_logger(__name__)
@@ -90,12 +90,17 @@ LENGTH_RULES = {
         "limit is the prompt's one 'each lesson body is plain text of at most N words' before its first "
         "<learner_request> or <source> tag, if N is under cutoff, else default_limit; the multiplier is 1 at or "
         "under the limit, (cutoff - words) / (cutoff - limit) between, 0 at or past cutoff, on the longest lesson's "
-        "count or the lessons' mean (aggregate); score and expected_score are Jev's times the multiplier, rounded to "
-        "4 places, and rank follows them; an answer that fails its format check still scores 0"
+        "count or the lessons' mean (aggregate); but if those instructions say both 'Write exactly 3 connected "
+        "lessons, each about N words long' and 'Aim for about N words per lesson' (case-insensitive), each with one "
+        "N, the same in both, the prompt has a word target N instead: the multiplier is 1 when the lessons' mean is "
+        "within target_tolerance of N (ends included), past it 0, or with target_ramp R above 0, falling linearly "
+        "to 0 over R more words; a prompt with one of those lines, or two different N, keeps the limit rule; score "
+        "and expected_score are Jev's times the multiplier, rounded to 4 places, and rank follows them; an answer "
+        "that fails its format check still scores 0"
     ),
 }
 # Added to every score row while lesson_length is on: Jev's own scores, and what the multiplier was taken from.
-LENGTH_FIELDS = ("jev_score", "jev_expected_score", "word_counts", "word_limit", "length_multiplier")
+LENGTH_FIELDS = ("jev_score", "jev_expected_score", "word_counts", "word_limit", "word_target", "length_multiplier")
 
 
 def apply_lesson_length(row: dict, task: str | None, prompt: str, checked: bool, cfg) -> dict:
@@ -104,8 +109,11 @@ def apply_lesson_length(row: dict, task: str | None, prompt: str, checked: bool,
     raw = {"jev_score": row["score"] if checked else None,
            "jev_expected_score": row["expected_score"] if checked else None}
     if task not in LENGTH_RULES or not checked:
-        return row | raw | {"word_counts": None, "word_limit": None, "length_multiplier": None}
-    m, counts, limit = course_multiplier(row["text"], prompt, cfg.cutoff, cfg.aggregate, cfg.default_limit)
+        return row | raw | {"word_counts": None, "word_limit": None, "word_target": None, "length_multiplier": None}
+    m, counts, words = course_multiplier(row["text"], prompt, cfg.cutoff, cfg.aggregate, cfg.default_limit,
+                                         cfg.target_tolerance, cfg.target_ramp)
     m = round(m, 4)
-    return row | raw | {"word_counts": counts, "word_limit": limit, "length_multiplier": m,
+    target = word_target(prompt)  # the rule `words` is from: a target, or else a limit
+    return row | raw | {"word_counts": counts, "word_limit": None if target else words, "word_target": target,
+                        "length_multiplier": m,
                         "score": round(row["score"] * m, 4), "expected_score": round(row["expected_score"] * m, 4)}

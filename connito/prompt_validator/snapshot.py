@@ -23,6 +23,7 @@ from connito.prompt_validator.answer_format import FORMAT_RULES, LENGTH_RULES
 from connito.prompt_validator.config import GREEDY, JUDGE_RULES_DATA
 from connito.prompt_validator.cutoff import prompt_cycle_length, training_cycle_blocks
 from connito.prompt_validator.jev import CRITERIA_BY_TASK, SCORE_QUESTIONS
+from connito.prompt_validator.methods import check_all, hashed
 from connito.prompt_validator.stage_io import read_rows, stage_path, write_rows
 from connito.shared import bt_compat
 from connito.shared.app_logging import structlog
@@ -167,7 +168,8 @@ JUDGE_RULES = JUDGE_RULES_DATA.get("judge_rules")
 def rules_sha256(pv_cfg, base: dict) -> str:
     """Hash of what decides a score: the base model rows of the meta, the answer settings, the SCORE_FIELDS, the model
     selection, copy and reward rules, the Jev questions, the levels and format rules by task, the lesson length rule
-    while it is on and, when they are judged, how miner prompts are judged."""
+    while it is on, each task's judging method when scoring_methods lists any and, when they are judged, how miner
+    prompts are judged."""
     settings = {field: get_nested_attr(pv_cfg, field) for field in SCORE_FIELDS}
     selection = {"model_selection": MODEL_SELECTION}
     if pv_cfg.model_selection == "all":  # no cap and no ranking: max_models and rank_by decide nothing
@@ -176,6 +178,9 @@ def rules_sha256(pv_cfg, base: dict) -> str:
     if pv_cfg.lesson_length.enabled:  # only then: off, the hash stays the one from before the length multiplier
         settings |= {"lesson_length": pv_cfg.lesson_length.model_dump(mode="json"),
                      "length_rules_by_task": LENGTH_RULES}
+    if pv_cfg.scoring_methods:  # only then: with none listed, the hash stays the one from before judging methods
+        settings |= {"scoring_methods": {task: hashed(m.method, m.parsed())
+                                         for task, m in sorted(pv_cfg.scoring_methods.items())}}
     if pv_cfg.judge_miner_prompts:  # only then: off, the hash stays the one from before miner prompts were judged
         settings |= {"miner_prompts": pv_cfg.miner_prompts.model_dump(mode="json"), "judge_rules": JUDGE_RULES}
     # Only then: by incentive, or with "all", the hash stays one without the loss settings.
@@ -482,6 +487,7 @@ def snapshot_meta(config, scoring_cycle_id: int) -> dict:
 def run_snapshot(config, scoring_cycle_id: int) -> list[dict]:
     pv = config.prompt_validator
     sync_owner_task(config)  # the owner's task as of now, not as of a boot before a long cutoff wait
+    check_all(pv)  # never snapshot a cycle under rules its scores stage could not apply
     blocks = read_rows(stage_path(pv.runs_dir, scoring_cycle_id, "cutoff"))[0]
     prompts, prompt_meta, miner, request = load_prompts(config, scoring_cycle_id)
 

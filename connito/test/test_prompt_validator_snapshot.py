@@ -520,7 +520,8 @@ def test_rules_hash_follows_the_lesson_length_rule_only_while_it_is_on(tmp_path,
     on = pv.model_copy(update={"lesson_length": LessonLengthCfg(enabled=True)})
     rules = snapshot.rules_sha256(on, _base())
     assert rules != off
-    for change in ({"cutoff": 400}, {"default_limit": 150}, {"aggregate": "mean"}):
+    for change in ({"cutoff": 400}, {"default_limit": 150}, {"aggregate": "mean"}, {"target_tolerance": 10},
+                   {"target_ramp": 40}):
         changed = on.model_copy(update={"lesson_length": LessonLengthCfg(enabled=True, **change)})
         assert snapshot.rules_sha256(changed, _base()) != rules
     monkeypatch.setattr(snapshot, "LENGTH_RULES", {"exp_lesson_residual": "another rule"})
