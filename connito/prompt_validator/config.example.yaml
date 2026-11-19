@@ -59,6 +59,16 @@ prompt_validator:
   #   default_limit: 200            # words per lesson body when the prompt states no single limit
   #   cutoff: 300                   # words at which the multiplier reaches 0, falling linearly from the limit
   #   aggregate: longest            # the longest lesson's count, or "mean" of the three
+  #   target_tolerance: 20          # a prompt with a word target N: 1 when the lessons' mean is within N +- this
+  #   target_ramp: 0                # words past the tolerance over which it falls to 0; 0: straight to 0
+  # scoring_methods:                # a task's judging method (methods/); a task not listed: plain_levels
+  #   exp_lesson_residual:
+  #     method: reference_pairwise  # Jev compares each answer with the prompt's reference
+  #     settings:
+  #       references_path: /abs/refs.jsonl   # mounted read-only; not in the hash
+  #       references_sha256: <64 hex>        # a missing or different file stops the loop
+  #       reference_weight: 1.0              # below 1, plain_levels' score makes up the rest
+  #       orders: b                          # a / b: the answer as course_a / course_b only; both: averaged
   # weights:                        # a dry run after report: runs/<cycle>/weights/weights.jsonl; it never sets weights
   #                                 # --loop --test cycles are measured too, against the real chain's row
   #   mode: dry_run                 # default off; on is refused

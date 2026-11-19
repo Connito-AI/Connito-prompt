@@ -23,6 +23,7 @@ from connito.prompt_validator.cutoff import check_phase_clock, report_before_blo
 from connito.prompt_validator.dataless import TesterRefused, validator_client
 from connito.prompt_validator.fetch import prune_shards, run_fetch
 from connito.prompt_validator.jev import JevVersionError
+from connito.prompt_validator.methods import MethodStop
 from connito.prompt_validator.judge import run_judge
 from connito.prompt_validator.report import run_report
 from connito.prompt_validator.reward import run_reward
@@ -240,6 +241,13 @@ def _main() -> None:
                     # Retried, every attempt would pay for its Jev calls again and be refused again.
                     logger.error("Jev answered with another version than the one requested by name: check Jev, and "
                                  "change jev.resolved only if that version is intended",
+                                 scoring_cycle_id=cycle_id, error=str(e))
+                    sys.exit(78)  # EX_CONFIG
+                except MethodStop as e:
+                    set_status(last_error=type(e).__name__)
+                    # Retried, it would stop again: someone has to fix the method's input or change the config.
+                    logger.error("a task's judging method cannot score as configured (see the error): fix what it "
+                                 "needs, or decide on the task's scoring_methods entry, then restart",
                                  scoring_cycle_id=cycle_id, error=str(e))
                     sys.exit(78)  # EX_CONFIG
                 except TesterRefused as e:

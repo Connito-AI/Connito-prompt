@@ -12,6 +12,7 @@ from connito.prompt_validator import run
 from connito.prompt_validator.config import DatalessCfg, PromptValidatorCfg
 from connito.prompt_validator.dataless import TesterRefused
 from connito.prompt_validator.jev import JevVersionError
+from connito.prompt_validator.methods.reference_pairwise import ReferenceFileError
 from connito.prompt_validator.stage_io import append_published, published_cycles, run_lock, stage_path, write_rows
 from connito.shared.config import CycleCfg
 from connito.test.test_prompt_validator_cutoff import OWNER_PERIODS
@@ -552,6 +553,17 @@ def test_a_jev_version_other_than_the_pin_is_not_retried_and_exits_78(tmp_path, 
     assert exit_.value.code == 78
     logged = capsys.readouterr().out + caplog.text
     assert "requested by name: check Jev" in logged and "'jev-1.15.0', pinned 'jev-1.14.0'" in logged
+
+
+def test_a_missing_or_changed_references_file_is_not_retried_and_exits_78(tmp_path, looping, capsys, caplog):
+    def stage(cfg, cycle_id, name):
+        raise ReferenceFileError("references file /r/refs.jsonl has sha256 0123456789ab, not the pinned 03f92405a687")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as exit_:
+        looping(lambda: _config(tmp_path, test_mode=True), stage=stage, sleep=lambda sec: pytest.fail("retried"))
+    assert exit_.value.code == 78
+    logged = capsys.readouterr().out + caplog.text
+    assert "decide on the task's scoring_methods entry" in logged and "not the pinned 03f92405a687" in logged
 
 
 def test_a_hotkey_off_test_hotkeys_is_not_retried_and_exits_78(tmp_path, looping, capsys, caplog):

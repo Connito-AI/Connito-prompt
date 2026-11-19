@@ -447,17 +447,19 @@ def test_the_scores_stage_passes_each_prompt_s_own_task(monkeypatch, tmp_path):
          if p == "1" else "4"}
         for u in (1, 2) for p in ("1", "2", "3")
     ])
-    seen = {}
+    seen = []
 
     class Client:
         def score_many(self, items, tasks=None):
-            seen["tasks"] = tasks
+            seen.append(tasks)
             return [{"score": 0.8, "expected_score": 0.8, "jev_call_id": "c"} for _ in items]
 
     monkeypatch.setattr(scores, "snapshot_meta", lambda config, cycle: {})
     monkeypatch.setattr(scores, "selected_prompts", lambda pv, cycle: [])
     monkeypatch.setattr(scores, "cycle_client", lambda pv, cycle: Client())
-    config = SimpleNamespace(prompt_validator=SimpleNamespace(runs_dir=tmp_path, lesson_length=LessonLengthCfg()))
+    config = SimpleNamespace(prompt_validator=SimpleNamespace(runs_dir=tmp_path, lesson_length=LessonLengthCfg(),
+                                                              scoring_methods={}))
 
     assert len(scores.run_scores(config, 7)) == 6
-    assert seen["tasks"] == [LESSON, "exp_pmc_residual", None] * 2
+    # plain_levels for each task (none listed in scoring_methods), one call per task, on that task's levels.
+    assert seen == [[LESSON] * 2, ["exp_pmc_residual"] * 2, [None] * 2]
