@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from bittensor.result import RpcPolicyError
 from bittensor.sp_core import Keypair
 from pydantic import ValidationError
 
@@ -99,7 +100,8 @@ def chain(monkeypatch, tmp_path):
     COMMIT_BLOCK_BASE + uid. Other training cycles' commits are `chain.at[training_cycle]` (none by default), with
     commitment records `chain.registrations_at[training_cycle]`, by default at 300 blocks before commit_1 + uid.
     Blocks in `chain.pruned` are discarded: a commits read there gets the head's, as get_chain_commits does, unless it
-    asks for no head fallback.
+    asks for no head fallback. An endpoint in `chain.refused` raises its error on every read; `chain.networks` lists
+    the endpoint of each Subtensor built.
     """
     state = SimpleNamespace(
         tempo=360,
@@ -116,6 +118,8 @@ def chain(monkeypatch, tmp_path):
         at={},
         registrations_at={},
         pruned=set(),
+        refused={},
+        networks=[],
     )
 
     def training_cycle(block):
@@ -132,8 +136,14 @@ def chain(monkeypatch, tmp_path):
     class FakeSubtensor:
         def __init__(self, network):
             self.network = network
+            state.networks.append(network)
+
+        def refuse(self):
+            if self.network in state.refused:
+                raise state.refused[self.network]
 
         def tempo(self, netuid, block=None):
+            self.refuse()
             if isinstance(state.tempo, Exception):
                 raise state.tempo
             return state.tempo
@@ -142,6 +152,7 @@ def chain(monkeypatch, tmp_path):
             raise AssertionError("the snapshot read a live metagraph instead of the cutoff block's")
 
         def query_map(self, item, params, block=None):
+            self.refuse()
             state.commitment_reads.append((item, params, block))
             unpruned(block)
             if isinstance(state.registrations, Exception):
@@ -520,7 +531,8 @@ def test_rules_hash_follows_the_lesson_length_rule_only_while_it_is_on(tmp_path,
     on = pv.model_copy(update={"lesson_length": LessonLengthCfg(enabled=True)})
     rules = snapshot.rules_sha256(on, _base())
     assert rules != off
-    for change in ({"cutoff": 400}, {"default_limit": 150}, {"aggregate": "mean"}):
+    for change in ({"cutoff": 400}, {"default_limit": 150}, {"aggregate": "mean"}, {"target_tolerance": 10},
+                   {"target_ramp": 40}):
         changed = on.model_copy(update={"lesson_length": LessonLengthCfg(enabled=True, **change)})
         assert snapshot.rules_sha256(changed, _base()) != rules
     monkeypatch.setattr(snapshot, "LENGTH_RULES", {"exp_lesson_residual": "another rule"})
@@ -1023,3 +1035,61 @@ def test_a_pruned_block_in_the_lookback_stops_the_snapshot(config, chain, which,
     assert not stage_path(config.prompt_validator.runs_dir, CYCLE_ID, "snapshot").parent.joinpath(
         "models.jsonl").exists()
     assert chain.reads == [(CUTOFF["commit_1_block"], CUTOFF["commit_2_block"], "miner")]
+
+
+PRIMARY, LATENT, SPARE = "wss://archive.example:443", "wss://archive.sub.latent.to:443", "wss://spare.example:443"
+RATE_LIMIT = RpcPolicyError("Historical work rate limit exceeded", policy="historical_work", reason="budget_exhausted")
+
+
+def test_a_refused_archive_read_moves_to_the_next_endpoint_and_stays_there(config, chain, caplog):
+    config.prompt_validator.archive_fallbacks = [LATENT, SPARE]
+    [unrefused] = snapshot.run_snapshot(config, CYCLE_ID)
+    chain.refused, chain.networks[:] = {PRIMARY: RATE_LIMIT}, []
+
+    with caplog.at_level(logging.INFO):
+        [meta] = snapshot.run_snapshot(config, CYCLE_ID)
+
+    # The cut and the lookback: refused on the primary once, then the fallback serves both, from the start.
+    assert chain.networks == [PRIMARY, LATENT, LATENT]
+    assert meta["snapshot_sha256"] == unrefused["snapshot_sha256"]
+    assert any("chain endpoint failed, trying the next" in r.getMessage() and LATENT in r.getMessage()
+               for r in caplog.records)
+
+
+def test_every_endpoint_refused_raises_the_last_error_and_writes_no_snapshot(config, chain):
+    config.prompt_validator.archive_fallbacks = [LATENT]
+    chain.refused = {PRIMARY: RATE_LIMIT, LATENT: RpcPolicyError("refused too")}
+
+    with pytest.raises(RpcPolicyError, match="refused too"):
+        snapshot.run_snapshot(config, CYCLE_ID)
+    assert chain.networks == [PRIMARY, LATENT]
+    assert not stage_path(config.prompt_validator.runs_dir, CYCLE_ID, "snapshot").parent.joinpath(
+        "models.jsonl").exists()
+
+
+def test_without_fallbacks_a_refused_read_raises_as_before(config, chain):
+    chain.refused = {PRIMARY: RATE_LIMIT}
+
+    with pytest.raises(RpcPolicyError, match="rate limit"):
+        snapshot.run_snapshot(config, CYCLE_ID)
+    assert chain.networks == [PRIMARY]
+
+
+def test_another_error_than_a_connection_one_does_not_move(config, chain):
+    config.prompt_validator.archive_fallbacks = [LATENT]
+    chain.tempo = Exception("State already discarded for BlockId::Number(9235871)")
+
+    with pytest.raises(RuntimeError, match="pruned block 9235871"):
+        snapshot.run_snapshot(config, CYCLE_ID)
+    assert chain.networks == [PRIMARY]
+
+
+def test_chain_endpoints_list_the_network_first_and_each_once(config):
+    config.prompt_validator.archive_fallbacks = [LATENT, PRIMARY, LATENT]
+    assert snapshot.chain_endpoints(config) == [PRIMARY, LATENT]
+
+
+def test_rules_hash_ignores_the_archive_fallbacks(tmp_path):
+    pv = PromptValidatorCfg(prompts_path=tmp_path / "prompts.jsonl")
+    assert snapshot.rules_sha256(pv.model_copy(update={"archive_fallbacks": [LATENT]}), _base()) == \
+        snapshot.rules_sha256(pv, _base())

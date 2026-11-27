@@ -81,6 +81,23 @@ def snapshot_hash(prompts: Iterable[dict]) -> str:
     return h.hexdigest()
 
 
+def canonical_answer(answer) -> bytes:
+    """An answer as answers_hash takes it: JSON with sorted keys and no spaces, UTF-8."""
+    return json.dumps(answer, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def answers_hash(prompts: Iterable[dict]) -> str:
+    """The answers hash, for when the server lists one beside snapshot_hash: sha256 over the prompts that carry an
+    answer, in prompt_id order, each its prompt_id as 8 bytes big endian, its 32-byte content_hash, then its
+    canonical answer as 4 bytes big endian of length and the bytes. The server's definition must be this one."""
+    h = hashlib.sha256()
+    for p in sorted((p for p in prompts if p.get("answer") is not None), key=lambda p: int(p["prompt_id"])):
+        answer = canonical_answer(p["answer"])
+        h.update(int(p["prompt_id"]).to_bytes(8, "big") + bytes.fromhex(p["content_hash"])
+                 + len(answer).to_bytes(4, "big") + answer)
+    return h.hexdigest()
+
+
 def chunk_rows(rows: list[dict], wrap: Callable[[list[dict]], dict]) -> list[list[dict]]:
     """Split rows into batches of at most MAX_ROWS whose wrapped body stays under BODY_CAP."""
     batches: list[list[dict]] = [[]]
@@ -199,7 +216,14 @@ class DatalessClient:
                 f"dataless-api snapshot does not check out: {len(prompts)} prompts hash to {got[:12]}, "
                 f"the server says {want_count} and {want_hash[:12]}"
             )
-        return {"snapshot_hash": want_hash, "snapshot_count": want_count, "prompts": prompts}
+        out = {"snapshot_hash": want_hash, "snapshot_count": want_count, "prompts": prompts}
+        # Not served yet: once the server lists an answers_hash, every page must give the same one.
+        served = {page["answers_hash"] for page in pages if page.get("answers_hash") is not None}
+        if len(served) > 1:
+            raise RuntimeError(f"dataless-api gave different answers hashes across tasks: {sorted(served)}")
+        if served:
+            [out["answers_hash"]] = served
+        return out
 
     def _list_task(self, cycle_id: int, task: str | None) -> dict:
         page_token, out = None, None
@@ -217,6 +241,11 @@ class DatalessClient:
     def task_request(self, customer_task_id: str) -> dict:
         """The customer request behind a task open now or in the cycle before; always under /v1 (no test copy)."""
         return self.request("GET", f"{REAL_API}/tasks/{quote(customer_task_id, safe='')}/request")
+
+    def task_sample(self, customer_task_id: str) -> dict:
+        """The task's one sample pool prompt with its answer (never drawn into a cycle): a format check before any
+        cycle. Always under /v1 (no test copy)."""
+        return self.request("GET", f"{REAL_API}/tasks/{quote(customer_task_id, safe='')}/sample")
 
     # --- the run ---
 

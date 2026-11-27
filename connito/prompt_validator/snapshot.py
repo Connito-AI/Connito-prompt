@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -23,6 +24,8 @@ from connito.prompt_validator.answer_format import FORMAT_RULES, LENGTH_RULES
 from connito.prompt_validator.config import GREEDY, JUDGE_RULES_DATA
 from connito.prompt_validator.cutoff import prompt_cycle_length, training_cycle_blocks
 from connito.prompt_validator.jev import CRITERIA_BY_TASK, SCORE_QUESTIONS
+from connito.prompt_validator.methods import check_all, hashed
+from connito.prompt_validator.methods.eps_error import AnswersFileError, answers_file_name
 from connito.prompt_validator.stage_io import read_rows, stage_path, write_rows
 from connito.shared import bt_compat
 from connito.shared.app_logging import structlog
@@ -167,7 +170,8 @@ JUDGE_RULES = JUDGE_RULES_DATA.get("judge_rules")
 def rules_sha256(pv_cfg, base: dict) -> str:
     """Hash of what decides a score: the base model rows of the meta, the answer settings, the SCORE_FIELDS, the model
     selection, copy and reward rules, the Jev questions, the levels and format rules by task, the lesson length rule
-    while it is on and, when they are judged, how miner prompts are judged."""
+    while it is on, each task's judging method when scoring_methods lists any and, when they are judged, how miner
+    prompts are judged."""
     settings = {field: get_nested_attr(pv_cfg, field) for field in SCORE_FIELDS}
     selection = {"model_selection": MODEL_SELECTION}
     if pv_cfg.model_selection == "all":  # no cap and no ranking: max_models and rank_by decide nothing
@@ -176,6 +180,9 @@ def rules_sha256(pv_cfg, base: dict) -> str:
     if pv_cfg.lesson_length.enabled:  # only then: off, the hash stays the one from before the length multiplier
         settings |= {"lesson_length": pv_cfg.lesson_length.model_dump(mode="json"),
                      "length_rules_by_task": LENGTH_RULES}
+    if pv_cfg.scoring_methods:  # only then: with none listed, the hash stays the one from before judging methods
+        settings |= {"scoring_methods": {task: hashed(m.method, m.parsed())
+                                         for task, m in sorted(pv_cfg.scoring_methods.items())}}
     if pv_cfg.judge_miner_prompts:  # only then: off, the hash stays the one from before miner prompts were judged
         settings |= {"miner_prompts": pv_cfg.miner_prompts.model_dump(mode="json"), "judge_rules": JUDGE_RULES}
     # Only then: by incentive, or with "all", the hash stays one without the loss settings.
@@ -256,6 +263,31 @@ def _unpruned(config, block: int | str, read):
         if "discarded" not in str(e):
             raise
         raise RuntimeError(f"{config.chain.network} has pruned block {block}: use an archive node") from None
+
+
+def chain_endpoints(config) -> list[str]:
+    """chain.network, then each of prompt_validator.archive_fallbacks, once each."""
+    return list(dict.fromkeys([config.chain.network, *config.prompt_validator.archive_fallbacks]))
+
+
+def on_endpoints(endpoints: list[str], read):
+    """read(subtensor) on endpoints[0], else on the next after a refused or failed connection (an RpcPolicyError is an
+    RpcConnectionError: a rate limit, say). The endpoint that served moves first, so later reads start there; the
+    chain at a block is the same on every node, so a read that moved is the read it replaces."""
+    for i, endpoint in enumerate(list(endpoints)):
+        try:
+            result = read(bittensor.Subtensor(network=endpoint))
+        except bt_compat.RpcConnectionError as e:
+            if i == len(endpoints) - 1:
+                raise
+            logger.warning("chain endpoint failed, trying the next", endpoint=endpoint, next=endpoints[i + 1],
+                           error=f"{type(e).__name__}: {e}"[:200])
+            continue
+        if i:
+            endpoints[:] = endpoints[i:] + endpoints[:i]
+            logger.info("chain read served by a fallback endpoint", endpoint=endpoint)
+        return result
+    raise AssertionError("no chain endpoint")  # chain_endpoints always names chain.network
 
 
 class ChainRead(NamedTuple):
@@ -434,7 +466,10 @@ def dataless_prompts(config, scoring_cycle_id: int) -> Prompts:
         raise RuntimeError(f"the dataless-api has no internal prompts for prompt cycle {scoring_cycle_id}")
     prompts = [
         {"prompt_id": str(p["prompt_id"]), "request_id": p["customer_task_id"], "prompt": p["text"], "request": None,
-         "customer_task_id": p["customer_task_id"], "content_hash": p["content_hash"]}
+         "customer_task_id": p["customer_task_id"], "content_hash": p["content_hash"],
+         # The pool prompt's answer (prompt-record serves it with the drawn prompt, after the cutoff): taken out by
+         # take_answers before prompts.jsonl is written.
+         **({"answer": p["answer"]} if p.get("answer") is not None else {})}
         for p in internal
     ]
     logger.info("prompts from the dataless-api", cycle=scoring_cycle_id, internal=len(internal),
@@ -446,6 +481,7 @@ def dataless_prompts(config, scoring_cycle_id: int) -> Prompts:
         "rollout_phase": view["policy"]["rollout_phase"],
         # Miners with a prompt set this cycle: the API takes no summary for them until their set is judged.
         "dataless_set_hotkeys": sorted({p["hotkey"] for p in listing["prompts"] if p["source"] == "miner"}),
+        **({"dataless_answers_hash": listing["answers_hash"]} if "answers_hash" in listing else {}),
     }
     if not config.prompt_validator.judge_miner_prompts:
         return Prompts(prompts, meta)
@@ -461,6 +497,57 @@ def dataless_prompts(config, scoring_cycle_id: int) -> Prompts:
                        pool_tasks=sorted(pool_tasks))
         return Prompts(prompts, meta, miner, {"missing": "several_tasks"})
     return Prompts(prompts, meta, miner, customer_request(config, client, tasks[0]))
+
+
+def take_answers(config, prompts: list[dict], prompt_meta: dict | None = None) -> tuple[dict[str, bytes], dict]:
+    """Takes every prompt's answer out of its row (so none reaches prompts.jsonl), and for each task scored by eps_error
+    with answers_source prompt_record returns its answers file's bytes (the pinned file's format, one row per prompt of
+    the task in prompt_id order) and the meta of them. When the list gave an answers hash, the answers must match it.
+    Stops (AnswersFileError, exit 78: the draw and its answers never change, so a retry would stop again) unless each
+    of the task's prompts came with a finite answer.eps_pct_change. Never logs an answer."""
+    served_hash = (prompt_meta or {}).get("dataless_answers_hash")
+    got_hash = dataless.answers_hash(prompts) if served_hash is not None else None
+    answers = {p["prompt_id"]: p.pop("answer", None) for p in prompts}
+    pv = config.prompt_validator
+    tasks = sorted(task for task, m in pv.scoring_methods.items()
+                   if m.method == "eps_error" and m.parsed().answers_source == "prompt_record"
+                   and any(p.get("customer_task_id") == task for p in prompts))
+    if not tasks:
+        return {}, {}
+    if pv.prompt_source != "dataless":
+        raise AnswersFileError(f"answers_source prompt_record for {tasks} needs prompt_source dataless")
+    if got_hash != served_hash:
+        raise AnswersFileError(f"the listed answers hash to {got_hash[:12]}, the dataless-api says {served_hash[:12]}")
+    files, meta = {}, {}
+    for task in tasks:
+        rows = []
+        for p in sorted((p for p in prompts if p.get("customer_task_id") == task), key=lambda p: int(p["prompt_id"])):
+            answer = answers[p["prompt_id"]]
+            value = answer.get("eps_pct_change") if isinstance(answer, dict) else None
+            if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value):
+                raise AnswersFileError(f"prompt-record served {task} prompt {p['prompt_id']} without a finite "
+                                       "answer.eps_pct_change")
+            rows.append({"content_hash": p["content_hash"], "prompt_id": p["prompt_id"],
+                         "eps_pct_change": float(value)})
+        files[task] = "".join(json.dumps(r) + "\n" for r in rows).encode()
+        meta[task] = {"count": len(rows), "file_sha256": hashlib.sha256(files[task]).hexdigest()}
+        logger.info("answers from prompt-record", task=task, answers=len(rows), file_sha256=meta[task]["file_sha256"])
+    return files, {"prompt_answers": meta}
+
+
+def sample_format_check(config, task: str) -> dict:
+    """prompt-record's sample for `task` (GET /v1/tasks/{task}/sample, never drawn into a cycle), checked as the
+    snapshot checks a drawn prompt: its text matches its content_hash and its answer has a finite eps_pct_change.
+    Returns field names and verdicts only, never the text or the answer's values."""
+    sample = dataless.validator_client(config).task_sample(task)
+    answer = sample.get("answer")
+    value = answer.get("eps_pct_change") if isinstance(answer, dict) else None
+    return {
+        "fields": sorted(sample),
+        "answer_fields": sorted(answer) if isinstance(answer, dict) else None,
+        "content_hash_matches_text": hashlib.sha256(sample["text"].encode()).hexdigest() == sample["content_hash"],
+        "eps_pct_change_ok": isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value),
+    }
 
 
 def load_prompts(config, scoring_cycle_id: int) -> Prompts:
@@ -482,16 +569,22 @@ def snapshot_meta(config, scoring_cycle_id: int) -> dict:
 def run_snapshot(config, scoring_cycle_id: int) -> list[dict]:
     pv = config.prompt_validator
     sync_owner_task(config)  # the owner's task as of now, not as of a boot before a long cutoff wait
+    check_all(pv)  # never snapshot a cycle under rules its scores stage could not apply
     blocks = read_rows(stage_path(pv.runs_dir, scoring_cycle_id, "cutoff"))[0]
     prompts, prompt_meta, miner, request = load_prompts(config, scoring_cycle_id)
+    answer_files, answer_meta = take_answers(config, prompts, prompt_meta)
 
-    subtensor = bittensor.Subtensor(network=config.chain.network)
+    endpoints = chain_endpoints(config)
     first_block = blocks["commit_1_block"]
     netuid = config.chain.netuid
-    tempo = _unpruned(config, first_block, lambda: bt_compat.get_tempo(subtensor, netuid, block=first_block))
-    if tempo is None:
-        raise RuntimeError(f"subnet {netuid} absent at block {first_block} on {config.chain.network}")
-    cut = read_chain(config, subtensor, first_block, blocks["commit_2_block"])
+
+    def read_cut(subtensor):
+        tempo = _unpruned(config, first_block, lambda: bt_compat.get_tempo(subtensor, netuid, block=first_block))
+        if tempo is None:
+            raise RuntimeError(f"subnet {netuid} absent at block {first_block} on {subtensor.network}")
+        return subtensor, read_chain(config, subtensor, first_block, blocks["commit_2_block"])
+
+    subtensor, cut = on_endpoints(endpoints, read_cut)
     checkpoints, commit_blocks = cut
     # Cached now, so a later scoring cycle's lookback reads it from disk.
     _cache(pv.runs_dir, first_block, blocks["commit_2_block"], cut)
@@ -530,7 +623,8 @@ def run_snapshot(config, scoring_cycle_id: int) -> list[dict]:
     )
     # Recorded in the rows, so reward reruns on this cycle's files alone.
     cutoff_cycle = blocks["training_cycle"]
-    seen = first_held(config, subtensor, scoring_cycle_id, cutoff_cycle, {c.model_hash for c in kept})
+    seen = on_endpoints(endpoints, lambda sub: first_held(config, sub, scoring_cycle_id, cutoff_cycle,
+                                                        {c.model_hash for c in kept}))
     models = sorted(
         ({**{field: getattr(c, field) for field in (*MODEL_FIELDS, "incentive")},
           "signed_commit_block": commit_blocks.get(c.hotkey),
@@ -552,6 +646,7 @@ def run_snapshot(config, scoring_cycle_id: int) -> list[dict]:
         **base,
         "rules_sha256": rules_sha256(pv, base),
         **prompt_meta,
+        **answer_meta,
     }
     if loss is not None:  # only then: by incentive, the meta and its hash are as before loss ranking
         # Model hashes placed by incentive after the scored ones.
@@ -563,6 +658,10 @@ def run_snapshot(config, scoring_cycle_id: int) -> list[dict]:
     if loss is not None:
         meta["loss_rank"]["source"] = loss.source
     write_rows(out_dir / "prompts.jsonl", prompts)
+    for stale in out_dir.glob(answers_file_name("*")):  # an earlier run's: a rerun would take it for this one's
+        stale.unlink()
+    for task, data in answer_files.items():
+        (out_dir / answers_file_name(task)).write_bytes(data)
     for name, rows in (("miner_prompts.jsonl", miner), ("request.json", [request])):
         if pv.judge_miner_prompts:
             write_rows(out_dir / name, rows)  # request.json: one JSON line, which json.load reads as the object

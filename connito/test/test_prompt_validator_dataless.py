@@ -547,6 +547,21 @@ def test_report_posts_the_run_models_summary_scores_with_outputs_then_publishes(
     assert fake.requests[-2]["headers"]["Content-Type"] == "application/json"
 
 
+def test_an_eps_error_score_carries_its_abs_error_null_for_a_format_failure(cycle):
+    config, fake = cycle
+    write_rows(stage_path(config.prompt_validator.runs_dir, CYCLE_ID, "scores"), [
+        {"uid": 1, "hotkey": "hk1", "model_hash": "", "prompt_id": "11", "expected_score": 0.9,
+         "method": "eps_error", "abs_error_pp": 4.25},
+        {"uid": 1, "hotkey": "hk1", "model_hash": "", "prompt_id": "12", "expected_score": 0.0,
+         "method": "eps_error", "abs_error_pp": None},
+        *({"uid": 3, "hotkey": "hk-miner-set", "model_hash": "", "prompt_id": p, "expected_score": 0.7,
+           "method": "jev"} for p in ("11", "12")),
+    ])
+    report.run_report(config, CYCLE_ID)
+    assert {k: r.get("abs_error_pp", "absent") for k, r in fake.model_scores.items()} == {
+        (1000, 11): 4.25, (1000, 12): None, (1002, 11): "absent", (1002, 12): "absent"}
+
+
 def test_a_model_whose_commit_the_api_cannot_take_is_left_out_and_said(cycle, caplog):
     config, fake = cycle
     with caplog.at_level(logging.WARNING):

@@ -224,6 +224,8 @@ def run_report(config, scoring_cycle_id: int) -> list[dict]:
         if s["hotkey"] not in model_ids:
             continue
         row = {"model_id": model_ids[s["hotkey"]], "prompt_id": int(s["prompt_id"]), "jev_score": s["expected_score"]}
+        if s.get("method") == "eps_error":  # null for a format failure
+            row["abs_error_pp"] = s["abs_error_pp"]
         if s["hotkey"] in kept:
             row["output"] = _output(text[(s["uid"], s["hotkey"], s["prompt_id"])])
         model_scores.append(row)

@@ -273,7 +273,7 @@ def test_with_lesson_length_on_a_long_course_scores_jev_times_its_multiplier_and
     h1, h2 = rows[(1, "p1")], rows[(2, "p1")]
     assert (h1["jev_score"], h1["jev_expected_score"]) == (1.0, 1.0)
     assert (h1["score"], h1["expected_score"], h1["length_multiplier"]) == (0.5, 0.5, 0.5)
-    assert (h1["word_counts"], h1["word_limit"]) == ([120, 250, 90], 200)
+    assert (h1["word_counts"], h1["word_limit"], h1["word_target"]) == ([120, 250, 90], 200, None)
     assert (h2["expected_score"], h2["length_multiplier"], h2["word_counts"]) == (1.0, 1.0, [200, 180, 150])
     assert (h2["rank"], h1["rank"], rows[(3, "p1")]["rank"]) == (0, 1, 1)  # ranked on the multiplied scores
     # p2 has no length rule: Jev's score as it is, and no counts.

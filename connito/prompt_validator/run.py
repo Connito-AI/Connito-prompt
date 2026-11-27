@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -23,11 +24,12 @@ from connito.prompt_validator.cutoff import check_phase_clock, report_before_blo
 from connito.prompt_validator.dataless import TesterRefused, validator_client
 from connito.prompt_validator.fetch import prune_shards, run_fetch
 from connito.prompt_validator.jev import JevVersionError
+from connito.prompt_validator.methods import MethodStop
 from connito.prompt_validator.judge import run_judge
 from connito.prompt_validator.report import run_report
 from connito.prompt_validator.reward import run_reward
 from connito.prompt_validator.scores import run_scores
-from connito.prompt_validator.snapshot import run_snapshot
+from connito.prompt_validator.snapshot import run_snapshot, sample_format_check
 from connito.prompt_validator.stage_io import LockHeld, published_cycles, run_lock, stage_path, write_rows
 from connito.prompt_validator.status import ledger_status, loop_status, set_status, stage_counts
 from connito.prompt_validator.weights import run_weights
@@ -174,7 +176,13 @@ def _main() -> None:
     parser.add_argument("--max-cycles", type=int,
                         help="With --loop: exit 0 once this process has seen this many cycles published (by it, or "
                              "found published already when it reported them)")
+    parser.add_argument("--sample-check", metavar="TASK",
+                        help="Fetch prompt-record's sample prompt for TASK and check its format as the snapshot "
+                             "checks a drawn prompt (eps_error's answers_source prompt_record); prints field names "
+                             "and verdicts only, then exits")
     args = parser.parse_args()
+    if args.sample_check and (args.loop or args.stage is not None or args.cycle_id is not None):
+        parser.error("--sample-check runs alone: it takes no --loop, --stage or --cycle-id")
     if args.loop and (args.cycle_id is not None or args.stage is not None):
         parser.error("--loop picks each cycle and runs its stages: it takes no --cycle-id or --stage")
     if args.max_cycles is not None and (not args.loop or args.max_cycles < 1):
@@ -202,6 +210,10 @@ def _main() -> None:
         parser.error(f"--env-file {env_file} does not exist")
 
     config = load_config(args, parser)
+    if args.sample_check:
+        result = sample_format_check(config, args.sample_check)
+        print(json.dumps(result, sort_keys=True))
+        sys.exit(0 if result["content_hash_matches_text"] and result["eps_pct_change_ok"] else 1)
     if args.stage == "weights" and config.prompt_validator.weights.mode != "dry_run":
         parser.error("--stage weights needs prompt_validator.weights.mode dry_run")
     if args.loop:
@@ -240,6 +252,13 @@ def _main() -> None:
                     # Retried, every attempt would pay for its Jev calls again and be refused again.
                     logger.error("Jev answered with another version than the one requested by name: check Jev, and "
                                  "change jev.resolved only if that version is intended",
+                                 scoring_cycle_id=cycle_id, error=str(e))
+                    sys.exit(78)  # EX_CONFIG
+                except MethodStop as e:
+                    set_status(last_error=type(e).__name__)
+                    # Retried, it would stop again: someone has to fix the method's input or change the config.
+                    logger.error("a task's judging method cannot score as configured (see the error): fix what it "
+                                 "needs, or decide on the task's scoring_methods entry, then restart",
                                  scoring_cycle_id=cycle_id, error=str(e))
                     sys.exit(78)  # EX_CONFIG
                 except TesterRefused as e:
